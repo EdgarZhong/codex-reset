@@ -455,7 +455,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 授权完成：清理子进程并用 launchctl 重启（由 LaunchAgent 管理）
+    /// 授权完成：清理子进程并重启本 App。优先 LaunchAgent 托管重启；未安装 LaunchAgent 时直接重新打开自身。
     private func restartAfterAuthorization() {
         appendLog("检测到辅助功能已授权，自动重启生效…", "Accessibility granted detected; restarting to apply…")
         manager.stopOwnServer()
@@ -465,10 +465,17 @@ final class AppModel: ObservableObject {
         proc.arguments = ["kickstart", "-k", "gui/\(uid)/com.codexreset.CodexReset"]
         do {
             try proc.run()
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 {
+                exit(0) // LaunchAgent 已接管重启
+            }
+            appendLog("LaunchAgent 重启不可用（未安装 LaunchAgent），改用直接重新打开本 App",
+                      "LaunchAgent restart unavailable (agent not installed); relaunching the app directly")
         } catch {
-            appendLog("自动重启失败，请手动重启：\(error)", "Auto-restart failed; please restart manually: \(error)")
-            return
+            appendLog("LaunchAgent 重启失败，改用直接重新打开：\(error)",
+                      "LaunchAgent restart failed; relaunching directly: \(error)")
         }
+        NSWorkspace.shared.open(Bundle.main.bundleURL)
         exit(0)
     }
 

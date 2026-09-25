@@ -32,5 +32,10 @@ echo "==> 导入钥匙串（login keychain）…"
 security import "$TMPD/cert.pem" -k "$KEYCHAIN" -T /usr/bin/codesign -A >/dev/null 2>&1
 security import "$TMPD/key.pem" -k "$KEYCHAIN" -T /usr/bin/codesign -A >/dev/null 2>&1
 
+echo "==> 标记证书信任（codeSign；可能弹出系统确认框）…"
+security find-certificate -c "$CERT" -p "$KEYCHAIN" > "$TMPD/cert-export.pem" 2>/dev/null
+security add-trusted-cert -r trustRoot -k "$KEYCHAIN" -p codeSign "$TMPD/cert-export.pem" 2>/dev/null || \
+    echo "    自动信任失败：请在「钥匙串访问」双击 $CERT → 信任 → 代码签名选「始终信任」"
+
 echo "==> 完成：证书 $CERT 已创建"
 echo "    之后运行 ./make_app.sh 会用它签名（签名固定，辅助功能授权长期有效）"
