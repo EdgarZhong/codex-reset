@@ -3,6 +3,16 @@ import AppKit
 // 全局持有 AppModel，供信号处理器做退出清理
 var globalModel: AppModel?
 
+/// 常规终止路径（面板退出按钮 / Cmd+Q / 菜单退出 / 注销关机等）统一经 delegate 清理：
+/// 无条件退掉自起的 app-server，不管 turn 是否仍在运行。
+/// NSApplication 不持有 delegate，必须全局强引用。
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        globalModel?.prepareForTermination()
+    }
+}
+var globalDelegate = AppDelegate()
+
 // 优雅退出：先停掉自起的 app-server 子进程
 signal(SIGTERM) { _ in
     Task { @MainActor in
@@ -45,6 +55,7 @@ if CommandLine.arguments.contains("--query") {
 // 顶层代码运行在主线程，用 assumeIsolated 满足 Swift 6 的 MainActor 隔离检查。
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+app.delegate = globalDelegate
 
 MainActor.assumeIsolated {
     let model = AppModel()

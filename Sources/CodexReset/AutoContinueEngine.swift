@@ -45,6 +45,8 @@ final class AutoContinueEngine {
     private var pendingReconciliations: [String: PendingSubmission] = [:]
     private let stateLock = NSLock()
     private var busyCount = 0
+    /// 正在监控运行中 turn 的 monitor 任务数（server 存活判据之一）
+    private var activeMonitors = 0
 
     var onLog: ((String, String) -> Void)?
     /// 需要用户在系统设置授权辅助功能时的回调（不自动弹设置，由 UI 引导）
@@ -88,7 +90,19 @@ final class AutoContinueEngine {
     }
 
     private func endWork() {
-        stateLock.lock(); busyCount -= 1; stateLock.unlock()
+        stateLock.lock(); busyCount -= 1
+        let idle = busyCount == 0 && activeMonitors == 0 && pendingReconciliations.isEmpty
+        stateLock.unlock()
+        recycleServerIfIdle(idle)
+    }
+
+    /// app-server 生命周期（用户裁定）：只有「确有 turn 在运行 / 确有对账待查」才允许存活；
+    /// 尝试明确失败、turn 全部结束、对账全部了结时当场回收，绝不留僵尸进程。
+    /// 回收同时会断开面板用量通道，由下一轮 30s 轮询按需 lazy 重建，属预期行为。
+    private func recycleServerIfIdle(_ idle: Bool) {
+        guard idle else { return }
+        manager.stopOwnServer()
+        onLog?("app-server 空闲已回收（无运行中 turn、无待查提交）", "Idle app-server recycled (no running turn, no pending submission)")
     }
 
     private func markHandled(_ threadId: String) {
@@ -405,13 +419,19 @@ final class AutoContinueEngine {
 
     // MARK: - turn 监控
 
-    /// 后台监控 turn 完成，完成后释放线程写锁（否则 Codex 桌面 app 无法打开该对话）
+    /// 后台监控 turn 完成，完成后释放线程写锁（否则 Codex 桌面 app 无法打开该对话）；
+    /// turn 结束且没有其它运行中任务时回收 app-server（不留闲置 server）
     private func monitorTurn(client: AppServerClient, threadId: String, turnId: String) {
+        stateLock.lock(); activeMonitors += 1; stateLock.unlock()
         Task {
             await Self.waitTurnCompletion(client: client, threadId: threadId, turnId: turnId)
             try? await client.requestDict("thread/unsubscribe", params: ["threadId": threadId])
             onLog?("线程 \(threadId) 的 turn 已结束，已释放线程（Codex 可重新打开该对话）",
                    "Turn ended for thread \(threadId); thread released (Codex can reopen it)")
+            stateLock.lock(); activeMonitors -= 1
+            let idle = busyCount == 0 && activeMonitors == 0 && pendingReconciliations.isEmpty
+            stateLock.unlock()
+            recycleServerIfIdle(idle)
         }
     }
 

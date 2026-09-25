@@ -78,7 +78,7 @@ final class GUIContinuationController {
 
         // ── D. Paste + Submit ──
         let firstSubmitAt: Date
-        switch pasteAndSubmit(command: command, appElement: appElement) {
+        switch pasteAndSubmit(command: command, app: app, appElement: appElement) {
         case .failed(let result):
             return result
         case .submitted(let at):
@@ -351,12 +351,13 @@ final class GUIContinuationController {
     }
 
     /// 粘贴 + 提交。
-    /// 口径（用户 2026-09-25 裁定）：不检查输入框是否有残留内容——有就直接追加到末尾发送，
-    /// 绝不因为残留而放弃发送；回执匹配用「相等或以 command 结尾」兼容追加语义。
-    private func pasteAndSubmit(command: String, appElement: AXUIElement) -> PasteSubmitOutcome {
-        // 光标移到文档末尾（Cmd+↓，NSTextView/contenteditable 通用），确保追加而非插入中间
-        postKeyCombo(keyCode: 125) // 125 = Down Arrow
-
+    /// 口径（用户 2026-09-25 裁定）：
+    /// 1) 不检查输入框是否有残留内容——有就直接追加到末尾发送，绝不因残留放弃发送；
+    ///    回执匹配用「相等或以 command 结尾」兼容追加语义。
+    /// 2) 粘贴可重试（最多 3 轮，退避 0.5s/1s）：聚焦后用户可能切走窗口导致 Cmd+V 落到别的 app
+    ///    （2026-09-25 实测失败案例），每轮先校验 Codex 仍在前台（不在则重新激活并重新聚焦），
+    ///    校验通过才发键盘事件。重试只发生在提交前，无业务副作用。
+    private func pasteAndSubmit(command: String, app: NSRunningApplication, appElement: AXUIElement) -> PasteSubmitOutcome {
         let pasteboard = NSPasteboard.general
         // 快照原剪贴板所有类型，defer 恢复（禁止永久覆盖用户剪贴板）
         var saved: [(type: NSPasteboard.PasteboardType, data: Data)] = []
@@ -372,29 +373,59 @@ final class GUIContinuationController {
             }
         }
 
-        // 写入本次 prompt
-        pasteboard.clearContents()
-        pasteboard.setString(command, forType: .string)
+        let backoff: [TimeInterval] = [0.5, 1.0]
+        for round in 0..<3 {
+            // 1) 前台校验：焦点可能被用户切走；不在前台先激活（激活后焦点未必回输入框，重走聚焦）
+            if !app.isActive {
+                log("GUI Tier 1：第 \(round + 1) 轮粘贴前 Codex 不在前台，重新激活…",
+                    "GUI Tier 1: round \(round + 1): Codex not frontmost before paste; reactivating…")
+                app.activate(options: [.activateAllWindows])
+                var becameActive = false
+                for _ in 0..<8 { // 最多 2s
+                    Thread.sleep(forTimeInterval: 0.25)
+                    if app.isActive { becameActive = true; break }
+                }
+                if !becameActive {
+                    log("GUI Tier 1：第 \(round + 1) 轮重新激活失败", "GUI Tier 1: round \(round + 1): reactivation failed")
+                    if round < 2 { Thread.sleep(forTimeInterval: backoff[round]) }
+                    continue
+                }
+                guard focusComposer(pid: app.processIdentifier) else {
+                    log("GUI Tier 1：第 \(round + 1) 轮重新聚焦输入框失败", "GUI Tier 1: round \(round + 1): refocus composer failed")
+                    if round < 2 { Thread.sleep(forTimeInterval: backoff[round]) }
+                    continue
+                }
+            }
 
-        // Cmd+V（keyCode 9 = V），等粘贴落地
-        postKeyCombo(keyCode: 9)
-        Thread.sleep(forTimeInterval: 0.5)
+            // 2) 写剪贴板 → 光标移到文档末尾（Cmd+↓，追加语义）→ Cmd+V，等粘贴落地
+            pasteboard.clearContents()
+            pasteboard.setString(command, forType: .string)
+            postKeyCombo(keyCode: 125) // 125 = Down Arrow
+            postKeyCombo(keyCode: 9)   // 9 = V
+            Thread.sleep(forTimeInterval: 0.5)
 
-        // 粘贴校验：读得到文本且不含 command = 明确未粘贴（剪贴板由 defer 恢复）；
-        // 读不到/非 String = 不可读，继续走，交给 DB 回执兜底
-        if let text = focusedComposerText(appElement: appElement), !text.contains(command) {
-            log("GUI Tier 1：粘贴未生效（输入框不含 prompt 文本）",
-                "GUI Tier 1: paste had no effect (composer lacks the prompt text)")
-            return .failed(.confirmedFailure(reason: "粘贴未生效", delivered: false))
+            // 3) 粘贴校验：含 command = 本轮成功；读不到/非 String = 不可读，继续走，交给 DB 回执兜底
+            if let text = focusedComposerText(appElement: appElement) {
+                guard text.contains(command) else {
+                    log("GUI Tier 1：第 \(round + 1) 轮粘贴未生效（输入框不含 prompt 文本）",
+                        "GUI Tier 1: round \(round + 1): paste had no effect (composer lacks the prompt text)")
+                    if round < 2 { Thread.sleep(forTimeInterval: backoff[round]) }
+                    continue
+                }
+            }
+            return submitStage(command: command, appElement: appElement)
         }
+        log("GUI Tier 1：粘贴重试 3 轮均未生效", "GUI Tier 1: paste ineffective across 3 rounds")
+        return .failed(.confirmedFailure(reason: "粘贴未生效（重试 3 轮）", delivered: false))
+    }
 
-        // Cmd+Enter（keyCode 36 = Return）提交，记录首次提交时刻
-        postKeyCombo(keyCode: 36)
+    /// Cmd+Enter 提交，记录首次提交时刻；1s 后复读：composer 仍保留完整 command = 提交未生效，只允许再按一次
+    private func submitStage(command: String, appElement: AXUIElement) -> PasteSubmitOutcome {
+        postKeyCombo(keyCode: 36) // 36 = Return
         let firstSubmitAt = Date()
         log("GUI Tier 1：已发送 Cmd+Enter，等待 SQLite 回执…",
             "GUI Tier 1: Cmd+Enter sent; awaiting SQLite evidence…")
 
-        // 1s 后复读：composer 仍保留完整 command = 提交未生效，只允许再按一次 Cmd+Enter
         Thread.sleep(forTimeInterval: 1.0)
         if let text = focusedComposerText(appElement: appElement), text.contains(command) {
             log("GUI Tier 1：提交未生效（输入框仍保留原文），重按一次 Cmd+Enter",

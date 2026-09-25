@@ -155,6 +155,16 @@ final class AppModel: ObservableObject {
         exit(0)
     }
 
+    /// 常规终止前的清理（delegate 在 Cmd+Q / 菜单退出 / 注销关机等路径调用；面板按钮与信号路径也会走到）：
+    /// 无条件退掉自起的 app-server——不管 turn 是否仍在运行。App 已退出，server 绝不允许残留。
+    /// kill -9 / 崩溃场景无法执行代码，由内核关闭 stdin 兜底：server 读到 EOF 自行退出
+    /// （2026-09-25 对 bundled codex 实测：EOF/SIGINT/SIGTERM 均 0.1s 内退出）。
+    func prepareForTermination() {
+        timer?.invalidate()
+        accessibilityPollTimer?.invalidate()
+        manager.stopOwnServer()
+    }
+
     private func startOwnServerFallback() async {
         do {
             let own = try manager.startOwnServer()

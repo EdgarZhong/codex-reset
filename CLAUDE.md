@@ -52,13 +52,31 @@
    - E2E#2（残留路径）：检测到 composer 残留「继续」== command → 跳过粘贴直接提交 → 仍置灰 → 最终复读可读含原文 → `confirmedFailure(delivered:false)`「允许 Tier 2 接管」
 3. **安装**：备份 `/tmp/CodexReset.app.bak-20260925-182526` → ad-hoc 签名 ✓ → app 内 `--query` 正常（own-server、13 暂停对话、config 哈希一致）
 4. **GUI 实测**：菜单栏「⏳ 46分钟」→ 面板显示上限/13 暂停对话/自动继续开关/指令框/无 remote_control 项/「辅助功能未授权」提示（ad-hoc 重签预期内，用户点「授权」重授）
+5. **confirmed 路径实证（19:26，额度 19:11 恢复后）**：`--e2e 01a0d813-… "继续"` → `RESULT confirmedSuccess turnId=01a0d84d-65b4-7281-af21-7240976b7386`；sqlite 独立验证：新 userMessage（ordinal 30 > baseline 20，文本「继续」）落入新 turn且 `thread_turns.status=inProgress`。GUI Tier 1 全链路（基线→激活→AX 聚焦→粘贴→提交→回执）首次真实闭环 ✅
 
 ### 剩余（按优先级）
 
-1. **19:11 额度恢复后 confirmed 路径实证**（已排程）：对临时 thread 重跑 `--e2e`，期望 `confirmedSuccess`（turn 真实运行，消耗极小额度）→ 全链路闭环。若用户已对新 app 勾选对话，真实 auto-continue 本身就是终极验收
-2. GUI 无权限路径（e07 类）本机 SKIP（Bash 子进程有 AX 权限；代码路径已人工核对）
-3. 冷启动分支（Desktop 未运行时）未实测；首次真实运行大概率覆盖
-4. 「输入框已有其它未发送内容」分支未实测（需要人工在 composer 放草稿的场景，路径简单已 review）
+1. ~~19:11 额度恢复后 confirmed 路径实证~~（19:26 已实证，见 §5 第 5 条）
+2. 安装当前工作区版本（用户确认后）：替换 `/Applications/CodexReset.app` 并重载
+3. GUI 无权限路径（e07 类）本机 SKIP（Bash 子进程有 AX 权限；代码路径已人工核对）
+4. 冷启动分支（Desktop 未运行时）未实测；首次真实运行大概率覆盖
+5. 「输入框已有其它未发送内容」分支未实测（需要人工在 composer 放草稿的场景，路径简单已 review）
+
+## 5+. 会话四：Tier 2 进程生命周期 + 粘贴重试（2026-09-25 晚，工作区未提交）
+
+**用户裁定（两轮）**：
+1. app-server 只有在「确有 turn 在运行 / 确有对账待查」时才允许存活；尝试明确失败（session 没起来）**当时即杀**，绝不留僵尸；CodexReset 自己退出时**不管 turn 是否运行中都杀**（杀的是 T2 自起的无 GUI app-server，Codex Desktop 进程永不碰）
+2. 粘贴不得一次失败就放弃：聚焦后用户切走窗口导致 Cmd+V 落空（19:12 真实案例）→ 必须多轮重试
+
+**实现**：
+- `main.swift`：`AppDelegate`（全局强引用）+ `applicationWillTerminate` → `prepareForTermination()`。根治点：此前 **Cmd+Q / 菜单退出 / 关机注销完全不清理子进程**（app 无 delegate）；面板按钮与 SIGTERM/SIGINT 路径原有清理保留
+- `AppModel.prepareForTermination()`：停两个 timer + 无条件 `stopOwnServer()`；`kill -9`/崩溃场景由内核关 stdin 兜底（**实测**：bundled codex app-server 对 EOF/SIGINT/SIGTERM 全部 0.1s 内退出，无孤儿可能）
+- `AutoContinueEngine`：新增 `activeMonitors` 计数；`endWork`/`monitorTurn` 收尾时判空闲（无尝试进行中、无运行中 turn、无 pending）→ `recycleServerIfIdle` 当场 `stopOwnServer()` 并记日志。失败即杀、turn 结束即杀、空闲即杀；用量通道被顺带断开属预期，30s 轮询 lazy 重建
+- `GUIContinuation.pasteAndSubmit`：重写为**最多 3 轮**（退避 0.5s/1s）：每轮先校验 `app.isActive`（不在前台 → 重新激活 + 等待 isActive + `focusComposer` 重聚焦，全失败才进下一轮），通过后才写剪贴板 + Cmd+↓ + Cmd+V；校验「含 command」才进 `submitStage`（Cmd+Enter + 1s 复读重按一次，逻辑不变）；3 轮全败 → `confirmedFailure(delivered:false)` 落 Tier 2
+
+**自测**：55 → **66/66**（新增 e10 失败即杀 / e10b 空闲即杀 / e11 turn 结束即杀 / e12 pending 了结后杀；fake_codex.py 增加 pidfile + `completed` mode）。注：调试中曾用 `ps` 管道抓取输出，满 64KB 会死锁——已改为 `kill(pid,0)` 探测，勿复用该反模式
+
+**19:12 真实 auto-observe 记录**：恢复检测 ✓ → AX 聚焦第 1 轮成功 → 粘贴被用户切窗打断（旧逻辑一次放弃）→ Tier 2 兜底遇 `already has an active writer`（thread 在 GUI 打开、被 GUI 内核持有，预期内，正是 GUI Tier 1 存在的理由）
 
 ## 6. 新会话接手指引
 
