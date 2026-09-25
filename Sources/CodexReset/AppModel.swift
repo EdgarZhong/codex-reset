@@ -88,6 +88,7 @@ final class AppModel: ObservableObject {
         // 暂停对话列表来自本地 sqlite，不依赖 app-server，立即加载
         refreshPausedThreads()
         refreshAllThreads()
+        startAccessibilityPolling()
         Task { await connectAndBegin() }
     }
 
@@ -183,12 +184,11 @@ final class AppModel: ObservableObject {
 
     // MARK: - 刷新
 
-    /// 刷新用量与暂停列表（暂停列表本地读取，不依赖 app-server 连接）
+    /// 刷新用量与暂停列表（暂停列表本地读取，不依赖 app-server 连接；辅助功能状态由 2s 轮询实时维护）
     func refreshNow() {
         refreshPausedThreads()
         // 全部对话列表同样定时刷新，对话标题保持最新（在 Codex 里重命名后自动跟上）
         refreshAllThreads()
-        accessibilityAuthorized = AppleScriptAutomation.hasAccessibilityPermission()
         Task { await refreshChannelAndUsage() }
     }
 
@@ -420,63 +420,56 @@ final class AppModel: ObservableObject {
         appendLog("已在 Codex 中打开对话 \(threadId)", "Opened chat \(threadId) in Codex")
     }
 
-    // MARK: - 辅助功能授权监控（授权后自动重启生效）
+    // MARK: - 辅助功能授权（实时轮询；权限每次调用实时判定，授权后立即生效，无需重启）
 
-    private var accessibilityMonitorTimer: Timer?
+    private var accessibilityPollTimer: Timer?
+
+    /// 每 2s 实时同步授权状态：面板永不过期，杜绝「已授权却显示未授权」的误报
+    private func startAccessibilityPolling() {
+        accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let trusted = AppleScriptAutomation.hasAccessibilityPermission()
+                if trusted != self.accessibilityAuthorized {
+                    self.accessibilityAuthorized = trusted
+                    self.appendLog(trusted ? "辅助功能已授权，GUI Tier 1 可用"
+                                           : "辅助功能授权已失效（App 可能被重新签名），请在系统设置重新勾选",
+                                   trusted ? "Accessibility granted; GUI Tier 1 available"
+                                           : "Accessibility grant lost (the app may have been re-signed); re-check it in System Settings")
+                }
+            }
+        }
+    }
 
     /// 辅助功能未授权时的通知（不自动弹系统设置，避免反复打扰）
     func notifyNeedAccessibility() {
         accessibilityAuthorized = AppleScriptAutomation.hasAccessibilityPermission()
         let note = NSUserNotification()
         note.title = "CodexReset"
-        note.informativeText = "辅助功能未授权，无法在 Codex 中输入「继续」。请点面板「授权辅助功能」勾选本 App（若勾选过仍提示，请重新勾选一次）。"
+        note.informativeText = "辅助功能未授权，无法在 Codex 中输入「继续」。请点面板「授权」，在弹出的系统窗口中点「打开系统设置」并勾选本 App（立即生效，无需重启）。"
         NSUserNotificationCenter.default.deliver(note)
     }
 
-    /// 手动打开系统设置引导授权，并轮询检测；一旦授权完成自动重启本 App
+    /// 面板「授权」按钮：触发系统官方授权弹窗（自带「打开系统设置」，App 自动进入列表），
+    /// 同时直接打开辅助功能设置页并前置窗口。已授权时也打开设置页便于核对，绝不静默无响应。
     func openAccessibilitySettings() {
-        guard !AppleScriptAutomation.hasAccessibilityPermission() else {
-            appendLog("辅助功能已授权", "Accessibility granted")
-            return
+        let trusted = AppleScriptAutomation.promptAccessibilityIfNeeded()
+        accessibilityAuthorized = trusted
+        if trusted {
+            appendLog("辅助功能已授权，打开设置页供核对", "Accessibility already granted; opening the settings pane for verification")
+        } else {
+            appendLog("已弹出系统授权窗口：点「打开系统设置」并勾选本 App；授权立即生效，无需重启",
+                      "System authorization prompt shown: click \"Open System Settings\" and check this app; it takes effect immediately, no restart needed")
         }
-        AppleScriptAutomation.openAccessibilitySettings()
-        appendLog("请在「系统设置 → 隐私与安全性 → 辅助功能」中勾选本 App，授权后会自动重启生效",
-                  "Please check this app in System Settings → Privacy & Security → Accessibility; it will restart automatically once granted")
-        accessibilityMonitorTimer?.invalidate()
-        accessibilityMonitorTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                if AppleScriptAutomation.hasAccessibilityPermission() {
-                    self.accessibilityMonitorTimer?.invalidate()
-                    self.accessibilityMonitorTimer = nil
-                    self.restartAfterAuthorization()
-                }
-            }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
         }
-    }
-
-    /// 授权完成：清理子进程并重启本 App。优先 LaunchAgent 托管重启；未安装 LaunchAgent 时直接重新打开自身。
-    private func restartAfterAuthorization() {
-        appendLog("检测到辅助功能已授权，自动重启生效…", "Accessibility granted detected; restarting to apply…")
-        manager.stopOwnServer()
-        let uid = getuid()
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        proc.arguments = ["kickstart", "-k", "gui/\(uid)/com.codexreset.CodexReset"]
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            if proc.terminationStatus == 0 {
-                exit(0) // LaunchAgent 已接管重启
-            }
-            appendLog("LaunchAgent 重启不可用（未安装 LaunchAgent），改用直接重新打开本 App",
-                      "LaunchAgent restart unavailable (agent not installed); relaunching the app directly")
-        } catch {
-            appendLog("LaunchAgent 重启失败，改用直接重新打开：\(error)",
-                      "LaunchAgent restart failed; relaunching directly: \(error)")
+        // 本 App 无 Dock 图标，设置窗口可能开在后台：延迟前置
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences")
+                .first?.activate(options: [.activateAllWindows])
         }
-        NSWorkspace.shared.open(Bundle.main.bundleURL)
-        exit(0)
     }
 
     // MARK: - 工具

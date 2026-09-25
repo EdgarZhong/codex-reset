@@ -575,6 +575,14 @@ struct AppleScriptAutomation {
         AXIsProcessTrusted()
     }
 
+    /// 触发系统官方授权弹窗（kAXTrustedCheckOptionPrompt），返回当前是否已授权。
+    /// 弹窗由系统绘制、自带「打开系统设置」按钮，App 会自动进入辅助功能列表；重复调用不会反复弹窗。
+    @discardableResult
+    static func promptAccessibilityIfNeeded() -> Bool {
+        let key = kAXTrustedCheckOptionPrompt.takeRetainedValue() as String
+        return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+    }
+
     /// 打开「系统设置 → 隐私与安全性 → 辅助功能」
     static func openAccessibilitySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
