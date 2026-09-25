@@ -1,6 +1,6 @@
 # CodexReset 控制链路转向（GUI Tier 1 + DB 回执）— 进度同步与 Handoff
 
-> 动态文档，随推进更新。规则与边界见 `AGENTS.md`。最后更新：2026-09-25 会话三（本轮改造完成并安装，待 19:11 confirmed 路径实证）
+> 动态文档，随推进更新。规则与边界见 `AGENTS.md`。最后更新：2026-09-25（首轮改动完成，待实战验证和后续优化）
 
 ## 1. 当前目标（唯一核心）
 
@@ -62,7 +62,7 @@
 4. 冷启动分支（Desktop 未运行时）未实测；首次真实运行大概率覆盖
 5. 「输入框已有其它未发送内容」分支未实测（需要人工在 composer 放草稿的场景，路径简单已 review）
 
-## 5+. 会话四：Tier 2 进程生命周期 + 粘贴重试（2026-09-25 晚，工作区未提交）
+## 5+. 会话四：Tier 2 进程生命周期 + 粘贴重试（2026-09-25 晚，已提交）
 
 **用户裁定（两轮）**：
 1. app-server 只有在「确有 turn 在运行 / 确有对账待查」时才允许存活；尝试明确失败（session 没起来）**当时即杀**，绝不留僵尸；CodexReset 自己退出时**不管 turn 是否运行中都杀**（杀的是 T2 自起的无 GUI app-server，Codex Desktop 进程永不碰）
@@ -77,6 +77,12 @@
 **自测**：55 → **66/66**（新增 e10 失败即杀 / e10b 空闲即杀 / e11 turn 结束即杀 / e12 pending 了结后杀；fake_codex.py 增加 pidfile + `completed` mode）。注：调试中曾用 `ps` 管道抓取输出，满 64KB 会死锁——已改为 `kill(pid,0)` 探测，勿复用该反模式
 
 **19:12 真实 auto-observe 记录**：恢复检测 ✓ → AX 聚焦第 1 轮成功 → 粘贴被用户切窗打断（旧逻辑一次放弃）→ Tier 2 兜底遇 `already has an active writer`（thread 在 GUI 打开、被 GUI 内核持有，预期内，正是 GUI Tier 1 存在的理由）
+
+## 5++. 仓库远端与阶段状态（2026-09-25）
+
+- 用户确认首轮改动及测试已完成，等待实战；后续优化需求待用户提出。
+- GitHub fork：`EdgarZhong/codex-reset`（公开，父仓库 `boyso/codex-reset`）。本地 `origin` 指向 fork，`upstream` 指向原作者仓库；`main` 跟踪 `origin/main`。
+- 首轮本地提交尚未推送到 fork；本阶段只完成远端关联。
 
 ## 6. 新会话接手指引
 
