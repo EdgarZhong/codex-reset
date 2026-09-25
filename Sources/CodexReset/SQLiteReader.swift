@@ -183,6 +183,13 @@ final class SQLiteReader {
 
     // MARK: - GUI Tier 1 发送回执（baseline / evidence / misroute）
 
+    /// 提交文本匹配：相等或以 command 结尾均视为本次提交。
+    /// 追加语义（用户 2026-09-25 裁定）：输入框有残留时直接追加发送，消息文本可能是「草稿+command」。
+    static func matchesCommand(_ text: String?, command want: String) -> Bool {
+        guard let text, !text.isEmpty else { return false }
+        return text == want || text.hasSuffix(want)
+    }
+
     /// 发送前记录目标 thread 基线。DB 不可读返回 nil（调用方应放弃 GUI 发送）。
     func captureSubmissionBaseline(threadId: String) -> SubmissionBaseline? {
         guard let row = queryRow(path: threadHistoryPath,
@@ -216,7 +223,7 @@ final class SQLiteReader {
             guard let itemId = row[0] as? String,
                   let turnId = row[1] as? String,
                   let json = row[3] as? String,
-                  Self.userMessageText(json) == want else { continue }
+                  Self.matchesCommand(Self.userMessageText(json), command: want) else { continue }
             var status = "", errorJson: String? = nil
             if let trow = queryRow(path: threadHistoryPath,
                                    sql: "SELECT status, error_json FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
@@ -248,7 +255,7 @@ final class SQLiteReader {
             guard let threadId = row[0] as? String,
                   let turnId = row[1] as? String,
                   let json = row[2] as? String,
-                  Self.userMessageText(json) == want else { continue }
+                  Self.matchesCommand(Self.userMessageText(json), command: want) else { continue }
             return (threadId, turnId)
         }
         return nil

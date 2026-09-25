@@ -67,6 +67,8 @@ final class GUIContinuationController {
         }
 
         // ── C. Focus composer ──
+        // Electron 的 AX 树在 AX 客户端附着后异步物化：激活后稍等再扫，避免第 1 轮永远空跑
+        Thread.sleep(forTimeInterval: 0.8)
         let pid = app.processIdentifier
         guard focusComposer(pid: pid) else {
             log("GUI Tier 1：无法定位或聚焦输入框", "GUI Tier 1: cannot locate or focus the composer")
@@ -220,7 +222,7 @@ final class GUIContinuationController {
                 if round < 2 { Thread.sleep(forTimeInterval: intervals[round]) }
                 continue
             }
-            // 递归遍历 AX 树收集候选（节点上限 500，防爆栈/爆循环）
+            // 递归遍历 AX 树收集候选（节点上限 8000；侧边栏可达数百节点，上限过小 DFS 走不到主区）
             var visited = 0
             var candidates: [ComposerCandidate] = []
             collectComposerCandidates(in: window, windowFrame: frame, visited: &visited, into: &candidates)
@@ -230,8 +232,8 @@ final class GUIContinuationController {
                     "GUI Tier 1: composer focused via AX (round \(round + 1), \(candidates.count) candidates)")
                 return true
             }
-            // 最后回退（每轮一次）：鼠标点击窗口底部，再验证 focused element 确为可编辑文本控件
-            if clickComposerFallback(appElement: appElement, windowFrame: frame) {
+            // 最后回退（每轮一次）：鼠标点击窗口底部，等 Electron AX 树物化后重扫聚焦
+            if clickComposerFallback(appElement: appElement, windowFrame: frame, window: window) {
                 log("GUI Tier 1：已通过点击窗口底部聚焦输入框（第 \(round + 1) 轮）",
                     "GUI Tier 1: composer focused via bottom click (round \(round + 1))")
                 return true
@@ -264,10 +266,11 @@ final class GUIContinuationController {
         return nil
     }
 
-    /// 递归收集 composer 候选：role 为文本控件、enabled、非搜索框、位于窗口下半部、宽度 ≥ 窗口 40%
+    /// 递归收集 composer 候选：role 为文本控件、enabled、非搜索框、位于窗口下半部、宽度 ≥ 窗口 40%。
+    /// 节点上限取 8000：DFS 会先扫完整侧边栏（200+ 对话可达数百节点），上限太小走不到主区（2026-09-25 实证 bug）。
     private func collectComposerCandidates(in element: AXUIElement, windowFrame: CGRect,
                                            visited: inout Int, into candidates: inout [ComposerCandidate]) {
-        guard visited < 500 else { return }
+        guard visited < 8000 else { return }
         visited += 1
 
         // 收集条件：文本控件；enabled 不为 false；非搜索框；位于窗口下半部；宽度 ≥ 窗口 40%。
@@ -306,11 +309,22 @@ final class GUIContinuationController {
         return CFEqual(unsafeDowncast(focusedRef, to: AXUIElement.self), candidate)
     }
 
-    /// 最后回退：CGEvent 点击窗口底部（midX, maxY-55），再验证 focused element 是可编辑文本控件
-    private func clickComposerFallback(appElement: AXUIElement, windowFrame: CGRect) -> Bool {
-        let point = CGPoint(x: windowFrame.midX, y: windowFrame.maxY - 55)
+    /// 最后回退：CGEvent 点击窗口底部（midX, maxY-60；输入框实测位于窗口底部上方 55~110pt 区间）。
+    /// Electron 的 AX 树在真实点击聚焦后才物化（2026-09-25 axdump 实证）：点击后稍等并
+    /// 重新扫描候选，命中 AXTextArea 就走标准 AX 聚焦验证；否则退回「focused element role 检查」。
+    private func clickComposerFallback(appElement: AXUIElement, windowFrame: CGRect, window: AXUIElement) -> Bool {
+        let point = CGPoint(x: windowFrame.midX, y: windowFrame.maxY - 60)
         postMouseClick(at: point)
-        Thread.sleep(forTimeInterval: 0.3)
+        Thread.sleep(forTimeInterval: 0.6)
+        // 树物化后重扫候选，走标准 AX 聚焦 + CFEqual 验证
+        var visited = 0
+        var candidates: [ComposerCandidate] = []
+        collectComposerCandidates(in: window, windowFrame: windowFrame, visited: &visited, into: &candidates)
+        if let best = candidates.max(by: composerLess),
+           focusComposerCandidate(best.element, appElement: appElement) {
+            return true
+        }
+        // 退化判定：focused element 是可编辑文本控件即算成功
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
               let focusedRef, CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else {
@@ -336,23 +350,12 @@ final class GUIContinuationController {
         case failed(GUIContinuationResult)
     }
 
-    /// 粘贴 + 提交
+    /// 粘贴 + 提交。
+    /// 口径（用户 2026-09-25 裁定）：不检查输入框是否有残留内容——有就直接追加到末尾发送，
+    /// 绝不因为残留而放弃发送；回执匹配用「相等或以 command 结尾」兼容追加语义。
     private func pasteAndSubmit(command: String, appElement: AXUIElement) -> PasteSubmitOutcome {
-        // 残留检测：限速等场景会在 composer 留下上次未发出的内容。
-        // - 已有内容恰为本次 command：跳过粘贴直接提交（避免拼成「继续继续」导致回执文本不匹配）；
-        // - 已有其它内容：绝不覆盖用户草稿，放弃本次 GUI 发送（delivered:false，Tier 2 可接管）。
-        if let existing = focusedComposerText(appElement: appElement)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !existing.isEmpty {
-            if existing == command.trimmingCharacters(in: .whitespacesAndNewlines) {
-                log("GUI Tier 1：输入框已有与本次相同的未发送内容，跳过粘贴直接提交",
-                    "GUI Tier 1: composer already holds the identical unsent text; skipping paste and submitting directly")
-            } else {
-                log("GUI Tier 1：输入框已有其它未发送内容（\(existing.prefix(20))…），为避免覆盖用户草稿放弃发送",
-                    "GUI Tier 1: composer holds other unsent content (\(existing.prefix(20))…); aborting to avoid overwriting the user's draft")
-                return .failed(.confirmedFailure(reason: "输入框已有未发送内容，为避免覆盖草稿已放弃", delivered: false))
-            }
-        }
+        // 光标移到文档末尾（Cmd+↓，NSTextView/contenteditable 通用），确保追加而非插入中间
+        postKeyCombo(keyCode: 125) // 125 = Down Arrow
 
         let pasteboard = NSPasteboard.general
         // 快照原剪贴板所有类型，defer 恢复（禁止永久覆盖用户剪贴板）
