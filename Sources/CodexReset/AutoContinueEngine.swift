@@ -1,82 +1,7 @@
 import Foundation
 import AppKit
-import ApplicationServices
 
-/// GUI 自动化回退（Tier 3）：先用深链打开 Codex 对应对话，再粘贴指令并回车。
-/// 依赖辅助功能权限（System Events）。
-struct AppleScriptAutomation {
-    static func sendContinue(threadId: String, command: String) throws {
-        let escaped = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        // 1) 深链打开/切换到对应对话，并等待界面加载（大对话可能需要一点时间）
-        if let url = URL(string: "codex://threads/\(threadId)") {
-            NSWorkspace.shared.open(url)
-        }
-        Thread.sleep(forTimeInterval: 3.0)
-        // 2) 激活 Codex（进程名为 ChatGPT）→ 点击输入框确保焦点 → 粘贴指令 → Cmd+Enter 发送
-        //    关键：必须先点击输入框，否则 keystroke v 会粘贴到当前焦点（可能是对话列表）而静默失效
-        let script = """
-        set the clipboard to "\(escaped)"
-        tell application id "com.openai.codex" to activate
-        delay 2.0
-        tell application "System Events"
-            tell process "ChatGPT"
-                set frontmost to true
-                try
-                    set win to front window
-                    set p to position of win
-                    set s to size of win
-                    set cx to (item 1 of p) + (item 1 of s) / 2
-                    set cy to (item 2 of p) + (item 2 of s) - 55
-                    click at {cx, cy}
-                end try
-            end tell
-            delay 0.6
-            keystroke "v" using command down
-            delay 0.5
-            key code 36 using command down
-        end tell
-        """
-        try runAppleScript(script)
-    }
-
-    static func activateApp() throws {
-        try runAppleScript(#"tell application id "com.openai.codex" to activate"#)
-    }
-
-    /// 检测辅助功能权限
-    static func hasAccessibilityPermission() -> Bool {
-        AXIsProcessTrusted()
-    }
-
-    /// 打开「系统设置 → 隐私与安全性 → 辅助功能」
-    static func openAccessibilitySettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    @discardableResult
-    static func runAppleScript(_ script: String) throws -> String {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-        try proc.run()
-        proc.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard proc.terminationStatus == 0 else {
-            let msg = String(data: data, encoding: .utf8) ?? "AppleScript 失败"
-            throw JSONRPCError(code: -1, message: msg, data: nil)
-        }
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-}
-
-/// 一次逻辑 continuation 的三态结果
+/// 一次逻辑 continuation 的三态结果（Tier 2 RPC 通道层面）
 enum ContinuationOutcome {
     /// 服务端已接受（turn.id 非空且 status 为 inProgress/completed）
     case confirmed(TurnStartResult)
@@ -95,21 +20,29 @@ enum ReconciliationResult {
     case unreadable(String)
 }
 
-/// 自动继续引擎，严格三层 fallback：
-/// - Tier 1：Remote Control control socket（调用方传入的 primary 客户端）
+/// 待补查的提交：GUI 提交用本地 SQLite 回执对账；RPC 提交用 thread/turns/list 对账
+private enum PendingSubmission {
+    case gui(command: String, baseline: SubmissionBaseline)
+    case rpc(clientUserMessageId: String)
+}
+
+/// 自动继续引擎，严格两层 fallback：
+/// - Tier 1：Codex Desktop GUI 自动化（deep link → AX 聚焦 composer → 粘贴提交 → SQLite 回执确认）
 /// - Tier 2：bundled codex app-server（stdio，lazy 启动，manager 独占持有）
-/// - Tier 3：GUI/Accessibility（仅在前两层全部明确失败时进入）
 ///
+/// 硬约束：GUI Tier 1 对某 thread 的尝试在确认完成前，绝不允许 Tier 2 对同一 thread 做任何写操作
+/// （engine 内顺序执行保证；delivered=true / uncertain 时直接返回，不落入 Tier 2）。
 /// ambiguous（结果未知）时先 reconciliation：确认已提交则视为成功；
-/// 确认未提交才允许下一层；无法确认则保持 uncertain，等待后续轮询补查。
+/// 确认未提交才允许重试；无法确认则保持 pending，等待后续轮询补查。
 final class AutoContinueEngine {
     let codexHome: String
     private let manager: AppServerManager
+    private let reader: SQLiteReader
 
     /// 已处理过的线程，避免重复继续（仅在明确成功或 reconciliation 确认后加入）
     private var handledThreads: Set<String> = []
-    /// 提交结果未知的线程（threadId → clientUserMessageId），等待后续 reconciliation
-    private var pendingReconciliations: [String: String] = [:]
+    /// 提交结果未知的线程（threadId → 待补查提交），等待后续 reconciliation
+    private var pendingReconciliations: [String: PendingSubmission] = [:]
     private let stateLock = NSLock()
     private var busyCount = 0
 
@@ -119,9 +52,17 @@ final class AutoContinueEngine {
     /// 最近一次继续失败的原因
     private(set) var lastFailureReason: String?
 
+    /// GUI Tier 1 发送器。测试可注入 fake；nil = 使用真实 GUIContinuationController。
+    var guiSender: ((String, String) -> GUIContinuationResult)?
+
+    /// GUI pending 补查超时：超时仍无落盘记录则视为「未提交」移除 pending。
+    /// 本地 SQLite 投影延迟为秒级，10 分钟足够保守。
+    private let guiPendingTimeoutMs = 10 * 60 * 1000
+
     init(codexHome: String, manager: AppServerManager) {
         self.codexHome = codexHome
         self.manager = manager
+        self.reader = SQLiteReader(codexHome: codexHome)
     }
 
     // MARK: - 状态查询
@@ -136,7 +77,7 @@ final class AutoContinueEngine {
         return pendingReconciliations[threadId] != nil
     }
 
-    /// 是否有 continuation / reconciliation 正在进行（Tier 1 热切换需避开）
+    /// 是否有 continuation / reconciliation 正在进行
     var isBusy: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
         return busyCount > 0
@@ -154,13 +95,9 @@ final class AutoContinueEngine {
         stateLock.lock(); handledThreads.insert(threadId); stateLock.unlock()
     }
 
-    private func setPending(_ threadId: String, _ clientId: String?) {
+    private func setPending(_ threadId: String, _ pending: PendingSubmission?) {
         stateLock.lock()
-        if let clientId {
-            pendingReconciliations[threadId] = clientId
-        } else {
-            pendingReconciliations.removeValue(forKey: threadId)
-        }
+        pendingReconciliations[threadId] = pending
         stateLock.unlock()
     }
 
@@ -168,11 +105,10 @@ final class AutoContinueEngine {
 
     /// 继续指定线程。返回是否确认成功。
     /// - Parameters:
-    ///   - primaryClient: 当前已连接的 app-server 客户端（Tier 1 或在用 Tier 2），可为 nil
     ///   - threadId: 目标线程
     ///   - command: 注入的指令
-    ///   - fallbackToGUI: 是否允许 Tier 3 GUI 自动化
-    func continueThread(primaryClient: AppServerClient?, threadId: String, command: String, fallbackToGUI: Bool) async -> Bool {
+    ///   - allowGUI: 是否允许 Tier 1 GUI 自动化（无头模式传 false）
+    func continueThread(threadId: String, command: String, allowGUI: Bool) async -> Bool {
         beginWork()
         defer { endWork() }
         lastFailureReason = nil
@@ -181,86 +117,76 @@ final class AutoContinueEngine {
         let clientUserMessageId = "codexreset-\(UUID().uuidString.lowercased())"
 
         var lastError = "无可用通道"
-        var definitiveFailure = false
-        var uncertainPending = false
 
-        // ── 第一层：当前客户端（Tier 1，或已在使用的 Tier 2）
-        if let primary = primaryClient {
-            if !primary.isOpen {
-                lastError = "当前通道连接已断开"
-                definitiveFailure = true
+        // ── Tier 1：GUI 自动化。delivered=true / uncertain 时绝不落到 Tier 2（防重复 turn）
+        if allowGUI {
+            let result: GUIContinuationResult?
+            if let guiSender {
+                // 测试注入：fake 发送器不受本机辅助功能权限状态影响
+                result = guiSender(threadId, command)
+            } else if AppleScriptAutomation.hasAccessibilityPermission() {
+                let gui = GUIContinuationController(codexHome: codexHome)
+                gui.onLog = { [weak self] zh, en in self?.onLog?(zh, en) }
+                result = gui.sendContinuation(threadId: threadId, command: command)
             } else {
-                let outcome = await attemptContinuation(client: primary, threadId: threadId,
-                                                        command: command, clientUserMessageId: clientUserMessageId)
-                switch await resolveOutcome(outcome, client: primary, threadId: threadId,
-                                           clientUserMessageId: clientUserMessageId) {
-                case .confirmed:
-                    return true
-                case .definitive(let why):
-                    lastError = why
-                    definitiveFailure = true
-                case .uncertainKept(let why):
-                    lastError = why
-                    uncertainPending = true
-                }
-            }
-        }
-
-        // ── 第二层：Tier 2 bundled app-server（lazy）：
-        // 仅当第一层明确失败（或无可用客户端）时启动；存在未确认的 ambiguous 提交时不得再发送
-        let primaryIsTier2 = primaryClient?.tier == .tier2OwnServer
-        if !uncertainPending, primaryClient == nil || (!primaryIsTier2 && definitiveFailure) {
-            do {
-                let t2 = try manager.startOwnServer()
-                if !t2.isInitialized {
-                    try await t2.initialize()
-                }
-                let outcome = await attemptContinuation(client: t2, threadId: threadId,
-                                                        command: command, clientUserMessageId: clientUserMessageId)
-                switch await resolveOutcome(outcome, client: t2, threadId: threadId,
-                                           clientUserMessageId: clientUserMessageId) {
-                case .confirmed:
-                    return true
-                case .definitive(let why):
-                    lastError = why
-                    definitiveFailure = true
-                case .uncertainKept(let why):
-                    lastError = why
-                    uncertainPending = true
-                }
-            } catch {
-                // 明确没有提交成功
-                lastError = "Tier 2 bundled app-server 不可用: \(error)"
-                definitiveFailure = true
-            }
-        }
-
-        // ── 第三层：GUI 自动化 —— 仅在前两层全部明确失败时进入；
-        // 存在未确认的 ambiguous 提交时绝不发送第二份 prompt
-        if fallbackToGUI && definitiveFailure && !uncertainPending {
-            if AppleScriptAutomation.hasAccessibilityPermission() {
-                do {
-                    try AppleScriptAutomation.sendContinue(threadId: threadId, command: command)
-                    onLog?("已通过 GUI 自动化发送「\(command)」（深链打开对话并粘贴）",
-                           "Sent \"\(command)\" via GUI automation (deep-linked into the chat and pasted)")
-                    markHandled(threadId)
-                    return true
-                } catch {
-                    lastError = "GUI 自动化失败: \(error)"
-                }
-            } else {
-                lastError = "辅助功能未授权，无法在 Codex 中输入。请在面板「辅助功能」状态点「授权」勾选本 App（若勾选过仍提示，请重新勾选一次）"
+                result = nil
+                lastError = "辅助功能未授权，跳过 GUI Tier 1"
+                onLog?(lastError, "Accessibility not granted; skipping GUI Tier 1")
                 onNeedAccessibility?()
             }
+            if let result {
+                switch result {
+                case .confirmedSuccess(let turnId):
+                    onLog?("GUI Tier 1 回执确认：prompt 已进入 thread 并启动 turn \(turnId)",
+                           "GUI Tier 1 receipt confirmed: prompt entered the thread and started turn \(turnId)")
+                    markHandled(threadId)
+                    return true
+                case .confirmedFailure(let reason, delivered: true):
+                    // Desktop 已收到 prompt（turn 执行失败 / 投递到错误 thread）：
+                    // 禁止 Tier 2 重发，也不标已处理（允许用户确认后再次手动继续）
+                    lastFailureReason = "GUI 已投递但未成功：\(reason)"
+                    onLog?(lastFailureReason!, "GUI delivered but unsuccessful: \(reason)")
+                    return false
+                case .confirmedFailure(let reason, delivered: false):
+                    // Desktop 未收到任何 prompt：Tier 2 可安全接管
+                    lastError = "GUI Tier 1 未提交任何 prompt（\(reason)）"
+                    onLog?(lastError, "GUI Tier 1 submitted nothing (\(reason))")
+                case .uncertain(let reason, let baseline):
+                    setPending(threadId, .gui(command: command, baseline: baseline))
+                    lastFailureReason = "GUI Tier 1 结果未知（\(reason)），已记录待 DB 对账，禁止 Tier 2 重发"
+                    onLog?(lastFailureReason!, "GUI Tier 1 outcome unknown (\(reason)); recorded for DB reconciliation, no Tier 2 resend")
+                    return false
+                }
+            }
+        }
+
+        // ── Tier 2：bundled app-server（仅当 GUI 明确「未提交任何 prompt」时进入）
+        do {
+            let t2 = try manager.startOwnServer()
+            if !t2.isInitialized {
+                try await t2.initialize()
+            }
+            let outcome = await attemptContinuation(client: t2, threadId: threadId,
+                                                    command: command, clientUserMessageId: clientUserMessageId)
+            switch await resolveOutcome(outcome, client: t2, threadId: threadId,
+                                        clientUserMessageId: clientUserMessageId) {
+            case .confirmed:
+                return true
+            case .definitive(let why):
+                lastError = why
+            case .uncertainKept(let why):
+                lastFailureReason = why
+                onLog?("继续结果未知，已记录待对账：\(why)",
+                       "Continuation outcome unknown; recorded for reconciliation: \(why)")
+                return false
+            }
+        } catch {
+            // 明确没有提交成功
+            lastError = "Tier 2 bundled app-server 不可用: \(error)"
         }
 
         lastFailureReason = lastError
-        if uncertainPending {
-            onLog?("继续结果未知，已记录待对账：\(lastError)",
-                   "Continuation outcome unknown; recorded for reconciliation: \(lastError)")
-        } else {
-            onLog?("继续失败：\(lastError)", "Continue failed: \(lastError)")
-        }
+        onLog?("继续失败：\(lastError)", "Continue failed: \(lastError)")
         return false
     }
 
@@ -272,7 +198,7 @@ final class AutoContinueEngine {
         case uncertainKept(String)
     }
 
-    /// 处理单层通道的尝试结果：confirmed 直接成功；
+    /// 处理 Tier 2 通道的尝试结果：confirmed 直接成功；
     /// uncertain 先 reconciliation（确认已提交→成功；确认未提交→明确失败；无法对账→保持 uncertain）
     private func resolveOutcome(_ outcome: ContinuationOutcome, client: AppServerClient, threadId: String,
                                 clientUserMessageId: String) async -> OutcomeResolution {
@@ -304,7 +230,7 @@ final class AutoContinueEngine {
             case .absent:
                 return .definitive("\(client.tier.name) 提交未生效（reconciliation 确认未进入 thread）: \(why)")
             case .unreadable(let err):
-                setPending(threadId, clientUserMessageId)
+                setPending(threadId, .rpc(clientUserMessageId: clientUserMessageId))
                 return .uncertainKept("结果未知且无法完成 reconciliation（\(err)）: \(why)")
             }
         }
@@ -355,17 +281,11 @@ final class AutoContinueEngine {
 
     // MARK: - reconciliation（只读）
 
-    /// reconciliation：确认某次 clientUserMessageId 是否真的进入了 thread。
-    /// 只做读取；优先复用 preferred 客户端，其次重连 Tier 1（用后即关），最后用 Tier 2。
+    /// RPC reconciliation：确认某次 clientUserMessageId 是否真的进入了 thread。
+    /// 只做读取；优先复用 preferred 客户端，其次用 Tier 2。
     private func reconcileSubmission(preferred: AppServerClient?, threadId: String, clientUserMessageId: String) async -> ReconciliationResult {
         if let preferred, preferred.isOpen {
             return await readTurnsForClient(client: preferred, threadId: threadId, clientUserMessageId: clientUserMessageId)
-        }
-        // 重连 Tier 1 只读（用后即关，不影响通道归属）
-        if let probe = await manager.probeDesktopControl() {
-            let c = probe.client
-            defer { c.close() }
-            return await readTurnsForClient(client: c, threadId: threadId, clientUserMessageId: clientUserMessageId)
         }
         // Tier 2（manager 独占持有，退出时统一回收）
         if let t2 = try? manager.startOwnServer() {
@@ -398,10 +318,12 @@ final class AutoContinueEngine {
         return .absent
     }
 
+    // MARK: - 对账补查
+
     /// 对历史 uncertain 提交补查（每轮自动继续前调用）：
     /// 确认已提交 → 记为已处理；确认未提交 → 移出 pending（本轮可重发）；无法确认 → 保留
     func resolvePendingReconciliations() async {
-        let snapshot: [(String, String)]
+        let snapshot: [(String, PendingSubmission)]
         stateLock.lock()
         snapshot = pendingReconciliations.map { ($0.key, $0.value) }
         stateLock.unlock()
@@ -409,23 +331,76 @@ final class AutoContinueEngine {
 
         beginWork()
         defer { endWork() }
-        for (threadId, clientId) in snapshot {
-            let result = await reconcileSubmission(preferred: nil, threadId: threadId, clientUserMessageId: clientId)
-            switch result {
-            case .found(let turnId):
-                onLog?("对账确认：thread \(threadId) 的上次提交已进入 thread（turn \(turnId)）",
-                       "Reconciliation: the earlier submission for thread \(threadId) did enter the thread (turn \(turnId))")
-                markHandled(threadId)
-                setPending(threadId, nil)
-            case .absent:
-                onLog?("对账确认：thread \(threadId) 的上次提交未生效，本轮允许重发",
-                       "Reconciliation: the earlier submission for thread \(threadId) never landed; resend allowed this round")
-                setPending(threadId, nil)
-            case .unreadable(let err):
-                onLog?("对账未完成（\(err)），thread \(threadId) 保持等待，不重发",
-                       "Reconciliation incomplete (\(err)); thread \(threadId) stays pending, no resend")
+        for (threadId, pending) in snapshot {
+            switch pending {
+            case .rpc(let clientId):
+                await resolveRPCPending(threadId: threadId, clientUserMessageId: clientId)
+            case .gui(let command, let baseline):
+                resolveGUIPending(threadId: threadId, command: command, baseline: baseline)
             }
         }
+    }
+
+    /// RPC（Tier 2）pending：thread/turns/list 对账
+    private func resolveRPCPending(threadId: String, clientUserMessageId: String) async {
+        let result = await reconcileSubmission(preferred: nil, threadId: threadId, clientUserMessageId: clientUserMessageId)
+        switch result {
+        case .found(let turnId):
+            onLog?("对账确认：thread \(threadId) 的上次提交已进入 thread（turn \(turnId)）",
+                   "Reconciliation: the earlier submission for thread \(threadId) did enter the thread (turn \(turnId))")
+            markHandled(threadId)
+            setPending(threadId, nil)
+        case .absent:
+            onLog?("对账确认：thread \(threadId) 的上次提交未生效，本轮允许重发",
+                   "Reconciliation: the earlier submission for thread \(threadId) never landed; resend allowed this round")
+            setPending(threadId, nil)
+        case .unreadable(let err):
+            onLog?("对账未完成（\(err)），thread \(threadId) 保持等待，不重发",
+                   "Reconciliation incomplete (\(err)); thread \(threadId) stays pending, no resend")
+        }
+    }
+
+    /// GUI（Tier 1）pending：本地 SQLite 回执对账（只读；投影延迟秒级）
+    private func resolveGUIPending(threadId: String, command: String, baseline: SubmissionBaseline) {
+        guard let evidence = reader.findSubmissionEvidence(threadId: threadId, baseline: baseline, command: command) else {
+            let elapsed = Int(Date().timeIntervalSince1970 * 1000) - baseline.attemptStartedAtMs
+            if elapsed > guiPendingTimeoutMs {
+                onLog?("GUI 提交 \(elapsed / 60000) 分钟后仍无落盘记录，视为未提交：移除 pending，允许下轮重发",
+                       "No DB record after \(elapsed / 60000) min; treating as never submitted: pending cleared, resend allowed next round")
+                setPending(threadId, nil)
+            } else {
+                onLog?("GUI 提交尚未落盘，继续等待对账（不重复发送）",
+                       "GUI submission not yet visible in DB; keep waiting (no resend)")
+            }
+            return
+        }
+        let status = evidence.turnStatus
+        if evidence.isNewTurn && (status == "inProgress" || status == "completed") {
+            onLog?("对账确认：GUI 提交已进入 thread（turn \(evidence.turnId)，status \(status)），标记已处理",
+                   "Reconciliation: GUI submission entered the thread (turn \(evidence.turnId), status \(status)); marked handled")
+            markHandled(threadId)
+            setPending(threadId, nil)
+            return
+        }
+        if status == "failed" || status == "interrupted" {
+            var msg = ""
+            if let ej = evidence.turnErrorJson, let d = ej.data(using: .utf8),
+               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                msg = o["message"] as? String ?? ""
+            }
+            if msg.isEmpty { msg = evidence.turnErrorJson.map { String($0.prefix(200)) } ?? "" }
+            onLog?("对账确认：GUI 提交已落盘但 turn \(status)（\(msg)）：移除 pending，不标记已处理，允许将来重试",
+                   "Reconciliation: GUI submission landed but turn \(status) (\(msg)); pending cleared, not handled, retry allowed later")
+            setPending(threadId, nil)
+            return
+        }
+        if !evidence.isNewTurn {
+            onLog?("对账异常：userMessage 落入已存在 turn（\(evidence.turnId)），保持 pending 等待下一轮",
+                   "Reconciliation anomaly: userMessage landed in a pre-existing turn (\(evidence.turnId)); stays pending")
+            return
+        }
+        onLog?("对账：turn \(evidence.turnId) 状态 \(status) 未决，保持 pending（不重复发送）",
+               "Reconciliation: turn \(evidence.turnId) status \(status) undecided; stays pending (no resend)")
     }
 
     // MARK: - turn 监控

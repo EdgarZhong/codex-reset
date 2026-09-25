@@ -44,15 +44,13 @@ enum RPCTransportError: Swift.Error, CustomStringConvertible {
 /// - transport 关闭/子进程退出时，所有 pending 请求立即以 connection-closed 失败；
 /// - timeout 后请求从 pending 中移除，迟到的响应会被丢弃（不会二次 resume continuation）。
 final class AppServerClient {
-    /// 通道层级（用于日志与 fallback 决策）
+    /// 通道层级（用于日志）。Remote Control（tier1RemoteControl）已废弃，只剩 Tier 2。
     enum Tier {
-        case tier1RemoteControl
         case tier2OwnServer
         case unknown
 
         var name: String {
             switch self {
-            case .tier1RemoteControl: return "Tier 1（Remote Control）"
             case .tier2OwnServer: return "Tier 2（bundled app-server）"
             case .unknown: return "app-server"
             }

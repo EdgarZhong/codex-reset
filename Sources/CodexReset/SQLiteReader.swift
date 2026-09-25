@@ -15,6 +15,28 @@ struct PausedThread {
     let failedAt: Int
 }
 
+/// GUI Tier 1 发送前的目标 thread 基线
+struct SubmissionBaseline {
+    /// 目标 thread 当前最大 rollout_ordinal（无记录时为 0）
+    let maxOrdinal: Int
+    /// 发送前已存在的 turn id 集合（用于判定新 turn）
+    let turnIds: Set<String>
+    /// 尝试开始时间（Unix 毫秒），misroute 排查用
+    let attemptStartedAtMs: Int
+}
+
+/// 在目标 thread 中找到的本次提交证据
+struct SubmissionEvidence {
+    let itemId: String
+    let turnId: String
+    /// 是否属于发送前不存在的新 turn
+    let isNewTurn: Bool
+    /// thread_turns.status（inProgress/completed/failed/interrupted/…）
+    let turnStatus: String
+    /// turn 的 error_json（失败时带原因）
+    let turnErrorJson: String?
+}
+
 final class SQLiteReader {
     let codexHome: String
 
@@ -159,6 +181,92 @@ final class SQLiteReader {
         return nil
     }
 
+    // MARK: - GUI Tier 1 发送回执（baseline / evidence / misroute）
+
+    /// 发送前记录目标 thread 基线。DB 不可读返回 nil（调用方应放弃 GUI 发送）。
+    func captureSubmissionBaseline(threadId: String) -> SubmissionBaseline? {
+        guard let row = queryRow(path: threadHistoryPath,
+                                 sql: "SELECT COALESCE(MAX(rollout_ordinal),0) FROM thread_items WHERE thread_id = ?",
+                                 args: [threadId]),
+              let turnRows = queryRows(path: threadHistoryPath,
+                                       sql: "SELECT turn_id FROM thread_turns WHERE thread_id = ?",
+                                       args: [threadId]) else {
+            return nil
+        }
+        let turnIds = Set(turnRows.compactMap { $0[0] as? String })
+        return SubmissionBaseline(maxOrdinal: row[0] as? Int ?? 0,
+                                  turnIds: turnIds,
+                                  attemptStartedAtMs: Int(Date().timeIntervalSince1970 * 1000))
+    }
+
+    /// 在目标 thread 查找 rollout_ordinal > baseline 且文本一致的新 userMessage，
+    /// 命中后附上其 turn 的当前状态。未命中返回 nil（注意：nil ≠ 未提交，可能只是投影延迟）。
+    func findSubmissionEvidence(threadId: String, baseline: SubmissionBaseline, command: String) -> SubmissionEvidence? {
+        let want = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !want.isEmpty,
+              let rows = queryRows(path: threadHistoryPath, sql: """
+                  SELECT item_id, turn_id, rollout_ordinal, item_json
+                  FROM thread_items
+                  WHERE thread_id = ? AND item_type = 'userMessage' AND rollout_ordinal > ?
+                  ORDER BY rollout_ordinal ASC
+                  """, args: [threadId, baseline.maxOrdinal]) else {
+            return nil
+        }
+        for row in rows {
+            guard let itemId = row[0] as? String,
+                  let turnId = row[1] as? String,
+                  let json = row[3] as? String,
+                  Self.userMessageText(json) == want else { continue }
+            var status = "", errorJson: String? = nil
+            if let trow = queryRow(path: threadHistoryPath,
+                                   sql: "SELECT status, error_json FROM thread_turns WHERE thread_id = ? AND turn_id = ?",
+                                   args: [threadId, turnId]) {
+                status = trow[0] as? String ?? ""
+                errorJson = trow[1] as? String
+            }
+            return SubmissionEvidence(itemId: itemId, turnId: turnId,
+                                      isNewTurn: !baseline.turnIds.contains(turnId),
+                                      turnStatus: status, turnErrorJson: errorJson)
+        }
+        return nil
+    }
+
+    /// misroute 排查：attemptStartedAtMs 之后其它 thread 出现相同文本的新 userMessage。
+    /// 命中返回 (threadId, turnId)；无命中返回 nil。
+    func findPossibleMisroute(afterMs: Int, command: String, excludingThreadId: String) -> (threadId: String, turnId: String)? {
+        let want = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !want.isEmpty,
+              let rows = queryRows(path: threadHistoryPath, sql: """
+                  SELECT thread_id, turn_id, item_json
+                  FROM thread_items
+                  WHERE thread_id != ? AND item_type = 'userMessage' AND created_at_ms >= ?
+                  ORDER BY created_at_ms ASC
+                  """, args: [excludingThreadId, afterMs]) else {
+            return nil
+        }
+        for row in rows {
+            guard let threadId = row[0] as? String,
+                  let turnId = row[1] as? String,
+                  let json = row[2] as? String,
+                  Self.userMessageText(json) == want else { continue }
+            return (threadId, turnId)
+        }
+        return nil
+    }
+
+    /// 从 userMessage 的 item_json 提取完整文本（所有 text part 拼接后去首尾空白）
+    static func userMessageText(_ itemJson: String) -> String? {
+        guard let data = itemJson.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["type"] as? String == "userMessage",
+              let content = obj["content"] as? [[String: Any]] else {
+            return nil
+        }
+        return content.compactMap { $0["text"] as? String }
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - 通用查询
 
     private func queryRow(path: String, sql: String, args: [Any] = []) -> [Any?]? {
@@ -253,88 +361,4 @@ final class SQLiteReader {
     }
 }
 
-// MARK: - config.toml 读取
-
-/// 读取 ~/.codex/config.toml 中的相关配置
-struct CodexConfig {
-    let remoteControlEnabled: Bool
-
-    static func load(codexHome: String) -> CodexConfig {
-        let path = codexHome + "/config.toml"
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return CodexConfig(remoteControlEnabled: false)
-        }
-        var remoteControl = false
-        var inFeatures = false
-        for rawLine in content.components(separatedBy: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("[") && line.hasSuffix("]") {
-                inFeatures = (line == "[features]")
-                continue
-            }
-            if inFeatures && line.hasPrefix("remote_control") {
-                remoteControl = line.lowercased().contains("true")
-            }
-        }
-        return CodexConfig(remoteControlEnabled: remoteControl)
-    }
-
-    /// 写入 [features] remote_control = true/false（保留原有内容；需重启 Codex 桌面 app 生效）
-    /// 注意：必须复用已有的 [features] 段，不能重复定义，否则 TOML 报 duplicate key
-    @discardableResult
-    static func setRemoteControl(codexHome: String, enabled: Bool) -> Bool {
-        let path = codexHome + "/config.toml"
-        let content = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        var lines = content.components(separatedBy: "\n")
-        let value = enabled ? "true" : "false"
-
-        // 找到所有段标题行（以 [ 开头 ] 结尾）
-        let sectionIndices = lines.indices.filter {
-            let t = lines[$0].trimmingCharacters(in: .whitespaces)
-            return t.hasPrefix("[") && t.hasSuffix("]")
-        }
-        // 定位 [features] 段
-        var featuresStart: Int?
-        for idx in sectionIndices where lines[idx].trimmingCharacters(in: .whitespaces) == "[features]" {
-            featuresStart = idx
-            break
-        }
-
-        var modified = false
-        if let start = featuresStart {
-            // 段范围：start ..< 下一个段标题（或文件末尾）
-            let end = sectionIndices.first(where: { $0 > start }) ?? lines.count
-            var inserted = false
-            for i in start..<end {
-                if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("remote_control") {
-                    lines[i] = "remote_control = \(value)"
-                    inserted = true
-                    modified = true
-                    break
-                }
-            }
-            if !inserted {
-                // 在段内末尾插入
-                lines.insert("remote_control = \(value)", at: end)
-                modified = true
-            }
-        } else {
-            // 完全没有 [features] 段才追加新段
-            while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
-                lines.removeLast()
-            }
-            lines.append("")
-            lines.append("[features]")
-            lines.append("remote_control = \(value)")
-            modified = true
-        }
-
-        guard modified else { return true }
-        do {
-            try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
-            return true
-        } catch {
-            return false
-        }
-    }
-}
+// Remote Control 已废弃（2026-09 本轮转向）：CodexReset 不再读写 ~/.codex/config.toml 的 [features] remote_control。

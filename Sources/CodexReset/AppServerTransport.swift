@@ -1,8 +1,9 @@
 import Foundation
 
-/// RPC 传输抽象。两种实现：
-/// - `WebSocketTransport`：Tier 1，桌面 app 的 Remote Control control socket（Unix socket + WebSocket Upgrade）
-/// - `StdioTransport`：Tier 2，本 App 自己启动的 `codex app-server`（stdin/stdout 换行分隔 JSON-RPC）
+/// RPC 传输抽象（Tier 2 bundled app-server 专用）。
+/// 当前唯一实现：`StdioTransport` —— 本 App 自己启动的 `codex app-server`
+/// （stdin/stdout 换行分隔 JSON-RPC，独占持有子进程）。
+/// Tier 1 GUI 自动化不经本协议层。
 protocol AppServerTransport: AnyObject {
     /// 收到一行 JSON 文本（已去掉换行）
     var onText: ((String) -> Void)? { get set }
@@ -18,27 +19,6 @@ protocol AppServerTransport: AnyObject {
     func send(_ text: String) throws
     /// 关闭连接；Tier 2 会终止自己启动的子进程
     func close()
-}
-
-// MARK: - Tier 1: WebSocket over Unix socket
-
-final class WebSocketTransport: AppServerTransport {
-    private let ws: WebSocketClient
-
-    var onText: ((String) -> Void)?
-    var onClose: ((Swift.Error?) -> Void)?
-    var isOpen: Bool { ws.isOpen }
-    var diagnosticTail: String { "" }
-
-    init(unixPath: String, handshakeTimeout: TimeInterval = 8) {
-        ws = WebSocketClient(transport: .unix(path: unixPath), handshakeTimeout: handshakeTimeout)
-        ws.onText = { [weak self] text in self?.onText?(text) }
-        ws.onClose = { [weak self] error in self?.onClose?(error) }
-    }
-
-    func start() throws { try ws.connect() }
-    func send(_ text: String) throws { try ws.sendText(text) }
-    func close() { ws.close() }
 }
 
 // MARK: - Tier 2: bundled codex app-server over stdio

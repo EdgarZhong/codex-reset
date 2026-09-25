@@ -61,28 +61,6 @@ struct SettingsPanelView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 205)
             }
-
-            Divider()
-                .overlay(Color.black.opacity(0.05))
-
-            // remote_control
-            VStack(alignment: .leading, spacing: 3) {
-                Toggle(isOn: Binding(
-                    get: { model.remoteControlEnabled },
-                    set: { model.setRemoteControl($0) }
-                )) {
-                    Text("remote_control")
-                        .font(.caption)
-                        .fontWeight(.medium)
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                Text(L("通过 Codex 本地协议继续对话：重启 Codex 后生效，无需辅助功能授权",
-                       "Continues chats via Codex's local protocol: takes effect after Codex restarts, no accessibility permission needed."))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
         .padding(14)
         .background(

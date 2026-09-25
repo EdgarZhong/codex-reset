@@ -30,7 +30,6 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(continueCommand, forKey: "continueCommand") }
     }
     @Published var isWorking = false
-    @Published var remoteControlEnabled: Bool
     /// 语言设置：system / zh / en（切换后写回 UserDefaults 并通过 objectWillChange 触发界面刷新）
     @Published var language: String {
         didSet {
@@ -41,7 +40,7 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    /// 本 App 是否已获得辅助功能授权（GUI 兜底通道所需；无参检测不弹窗）
+    /// 本 App 是否已获得辅助功能授权（GUI Tier 1 通道所需；无参检测不弹窗）
     @Published var accessibilityAuthorized: Bool = false
     /// 5 小时窗口时间线（每次用量重置记录一个点）
     @Published var resetHistory: [UsageResetEvent] = []
@@ -50,9 +49,8 @@ final class AppModel: ObservableObject {
     let manager: AppServerManager
     private let reader: SQLiteReader
     private let engine: AutoContinueEngine
+    /// 当前连接的 Tier 2 客户端（bundled app-server，manager 独占持有，退出时统一回收）
     private var client: AppServerClient?
-    /// Tier 1 缺少 ordinaryUsageAllowed 时，用于权威额度读取的 Tier 2 客户端（lazy，复用 manager 持有的进程）
-    private var authoritativeClient: AppServerClient?
     private var timer: Timer?
     /// 记录上一次是否处于「已到上限」状态，用于恢复检测
     private var wasLimited = false
@@ -66,7 +64,6 @@ final class AppModel: ObservableObject {
         self.engine = AutoContinueEngine(codexHome: codexHome, manager: manager)
         self.autoContinue = UserDefaults.standard.object(forKey: "autoContinue") as? Bool ?? true
         self.continueCommand = UserDefaults.standard.string(forKey: "continueCommand") ?? L("继续", "Continue")
-        self.remoteControlEnabled = CodexConfig.load(codexHome: codexHome).remoteControlEnabled
         self.language = UserDefaults.standard.string(forKey: "language") ?? "system"
         engine.onLog = { [weak self] zh, en in
             Task { @MainActor in self?.appendLog(zh, en) }
@@ -133,14 +130,13 @@ final class AppModel: ObservableObject {
         manager.stopOwnServer()
     }
 
-    /// 无头模式：连接后立即继续指定线程，打印结果
+    /// 无头模式：连接后立即继续指定线程，打印结果（跳过 GUI Tier 1，直走 Tier 2）
     func runHeadlessContinue(threadId: String) async {
         await connectAndBegin()
         let ok = await engine.continueThread(
-            primaryClient: client,
             threadId: threadId,
             command: continueCommand,
-            fallbackToGUI: false
+            allowGUI: false
         )
         print("continueResult=\(ok)")
         manager.stopOwnServer()
@@ -156,20 +152,6 @@ final class AppModel: ObservableObject {
     func stopAndExit() {
         manager.stopOwnServer()
         exit(0)
-    }
-
-    /// 开关 remote_control（写入 config.toml，需重启 Codex 桌面 app 后生效）
-    func setRemoteControl(_ enabled: Bool) {
-        if CodexConfig.setRemoteControl(codexHome: codexHome, enabled: enabled) {
-            remoteControlEnabled = enabled
-            let v = enabled ? "true" : "false"
-            appendLog("已写入 [features] remote_control = \(v)，请重启 Codex 桌面 app 后生效",
-                      "Wrote [features] remote_control = \(v); restart the Codex desktop app to take effect")
-            notify(title: enabled ? "已启用 remote_control" : "已关闭 remote_control",
-                   body: enabled ? "请重启 Codex 桌面 app，之后即可通过官方协议自动继续对话" : "已关闭，之后使用 app-server + GUI 兜底通道")
-        } else {
-            appendLog("写入 config.toml 失败", "Failed to write config.toml")
-        }
     }
 
     private func startOwnServerFallback() async {
@@ -210,9 +192,7 @@ final class AppModel: ObservableObject {
         Task { await refreshChannelAndUsage() }
     }
 
-    /// 通道维护 + 用量刷新：
-    /// - 当前通道断开 → 重建（Tier 1 探测优先，失败 lazy 启动 Tier 2）
-    /// - 正在使用 Tier 2 且 Remote Control 可能恢复 → 完整健康检查通过后才切回（不在 continuation 进行中热切换）
+    /// 通道维护 + 用量刷新：当前通道断开 → 重建（lazy 启动 Tier 2 bundled app-server）
     private func refreshChannelAndUsage() async {
         if let current = client, !current.isOpen {
             appendLog("app-server 通道已断开", "app-server channel closed")
@@ -222,36 +202,11 @@ final class AppModel: ObservableObject {
         }
 
         if client == nil {
-            if let probe = await manager.probeDesktopControl() {
-                client = probe.client
-                connectionMode = "desktop-control"
-                appendLog("已连接桌面 Codex app-server（remote-control），健康检查通过",
-                          "Connected to the desktop Codex app-server (remote-control); health check passed")
-                if let rl = probe.rateLimits { applyRateLimits(rl) }
-            } else {
-                await startOwnServerFallback()
-            }
-        } else if connectionMode == "own-server", !engine.isBusy {
-            await upgradeToTier1IfHealthy()
+            await startOwnServerFallback()
         }
 
         guard let client else { return }
         await refreshRateLimits(client: client)
-    }
-
-    /// Remote Control socket 重新可用时从 Tier 2 切回 Tier 1：
-    /// 仅在无进行中 continuation 时探测，完整健康检查通过才允许切换
-    private func upgradeToTier1IfHealthy() async {
-        guard manager.controlSocketExists() else { return }
-        guard let probe = await manager.probeDesktopControl() else { return }
-        let old = client
-        client = probe.client
-        connectionMode = "desktop-control"
-        appendLog("Remote Control 恢复健康，已切回桌面 app-server 通道",
-                  "Remote Control is healthy again; switched back to the desktop app-server channel")
-        old?.close()
-        manager.stopOwnServer()
-        if let rl = probe.rateLimits { applyRateLimits(rl) }
     }
 
     private func refreshRateLimits(client: AppServerClient) async {
@@ -261,13 +216,6 @@ final class AppModel: ObservableObject {
                   let parsed = try? JSONDecoder().decode(AccountRateLimits.self, from: data) else {
                 lastError = "用量响应解析失败"
                 appendLog("用量响应解析失败", "Failed to decode usage response")
-                return
-            }
-            // Tier 1 老/异常 server 未提供 ordinaryUsageAllowed 时，用 Tier 2 bundled server 做一次权威读取；
-            // Tier 1 仍是发送 prompt 的首选通道，不受影响
-            if parsed.ordinaryUsageAllowed == nil, client.tier == .tier1RemoteControl,
-               let authoritative = await authoritativeRateLimits() {
-                applyRateLimits(authoritative)
                 return
             }
             applyRateLimits(parsed)
@@ -282,22 +230,6 @@ final class AppModel: ObservableObject {
         lastError = nil
         checkRecovery(rl)
         trackWindowReset(rl)
-    }
-
-    /// 权威额度读取（Tier 2 bundled app-server；lazy 启动并复用，退出时随 manager 统一回收）
-    private func authoritativeRateLimits() async -> AccountRateLimits? {
-        if let c = authoritativeClient, !c.isOpen { authoritativeClient = nil }
-        if authoritativeClient == nil {
-            guard let c = try? manager.startOwnServer() else { return nil }
-            if !c.isInitialized {
-                do { try await c.initialize() } catch { return nil }
-            }
-            authoritativeClient = c
-        }
-        guard let c = authoritativeClient else { return nil }
-        guard let dict = try? await c.requestDict("account/rateLimits/read"),
-              let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
-        return try? JSONDecoder().decode(AccountRateLimits.self, from: data)
     }
 
     // MARK: - 用量历史（5h 窗口时间线）
@@ -441,16 +373,15 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 对单个对话执行继续
+    /// 对单个对话执行继续（Tier 1 GUI → Tier 2 bundled app-server）
     private func continueOne(paused: PausedThread, auto: Bool) async {
         isWorking = true
         appendLog("\(auto ? "自动" : "手动")继续：\(paused.title)",
                   "\(auto ? "Auto" : "Manual") continue: \(paused.title)")
         let ok = await engine.continueThread(
-            primaryClient: client,
             threadId: paused.threadId,
             command: continueCommand,
-            fallbackToGUI: true
+            allowGUI: true
         )
         isWorking = false
         if ok {
@@ -462,7 +393,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 手动立即继续：对所有勾选的对话（暂停 + 全部）执行继续
+    /// 手动立即继续：对所有勾选的对话（暂停 + 全部）执行继续（无额度许可门，用户显式点击即授权）
     func manualContinue() async {
         refreshPausedThreads()
         let targets = selectedTargets()
