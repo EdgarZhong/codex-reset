@@ -28,6 +28,7 @@
 | **限速时 Desktop 禁用提交**（用户截图实证） | 额度用尽时发送按钮置灰，Cmd+Enter 无效，粘贴正常 → 限速窗口 GUI Tier 1 必然「提交未生效」，这是产品语义不是故障。且 composer 会留下未发送残留 |
 | 深链冷启动 | `NSWorkspace.open` 只代表 LaunchServices 接受请求；E2E 时 Desktop 已在运行，`isFinishedLaunching` 轮询通过；冷启动分支（urlForApplication → openApplication → 15s）未实测（会话四可补） |
 | config.toml | sha256 = `248e1d1c0b63f0576446e77c415facd238bd7304fddb29ade4055f7375d581ad`（本轮前后一致 ✓；remote_control 读写已删除，本 App 不再碰 config.toml） |
+| **辅助功能授权与 ad-hoc 签名**（2026-09-25 实证） | **ad-hoc 每次重签指纹都变，授权绑定旧指纹即「反复勾仍显示未授权」**；本机未装 LaunchAgent 时旧的「授权后 kickstart 重启」静默失败（已修复为直接重开自身）。**最终方案：回退 ad-hoc、弃用自签名证书**（用户决定，本机自用不折腾）；正确授权路径 = 最后一次安装后系统设置→辅助功能→「+」添加 App→勾选。重装后需重勾一次（已授权状态：面板显示已授权 ✓） |
 | 旧 control socket 路线 | **整体废弃**（daemon 从未启动、socket 不存在、connectionCount=0 恒成立，会话二已证伪） |
 | FileHandle 管道读回归 | macOS 26 上 `FileHandle.read(upToCount:)` 阻塞读不唤醒；StdioTransport 用 POSIX read(2)（会话二修复，保持） |
 
