@@ -45,7 +45,8 @@ struct AccountRateLimits: Decodable {
 ///   ordinaryUsageAllowed == true
 ///   AND rateLimitReachedType == nil 或 "none"
 ///   AND spendControlReached != true
-/// usedPercent / resetsAt 只用于界面展示（百分比、倒计时、时间线），不再作为发送许可。
+/// usedPercent 只用于界面展示；resetsAt 还用于识别 primary 5h 窗口 rollover。
+/// 两者都不授予发送许可。
 enum QuotaRecovery {
     enum Decision: Equatable {
         /// 明确允许发送
@@ -85,6 +86,39 @@ enum QuotaRecovery {
 
     static func isAllowed(_ rl: AccountRateLimits) -> Bool {
         decision(rl).isAllowed
+    }
+}
+
+/// 跟踪 primary 5h 窗口 rollover。首次观测只建立 baseline；后续每次 resetsAt 变化
+/// 产生一个待处理 trigger，只有 QuotaRecovery 明确允许时才能消费。
+struct PrimaryWindowResetTracker {
+    enum Observation: Equatable {
+        case baseline
+        case unchanged
+        case rollover
+    }
+
+    private(set) var lastResetsAt: Int?
+    private(set) var pendingRollovers = 0
+
+    mutating func observe(resetsAt: Int) -> Observation {
+        guard let previous = lastResetsAt else {
+            lastResetsAt = resetsAt
+            return .baseline
+        }
+        guard previous != resetsAt else { return .unchanged }
+        lastResetsAt = resetsAt
+        pendingRollovers += 1
+        return .rollover
+    }
+
+    /// 每次只消费一个 rollover，重复轮询不会再次消费同一个 trigger。
+    mutating func consumePendingIfAllowed(_ rateLimits: AccountRateLimits) -> Bool {
+        guard pendingRollovers > 0, QuotaRecovery.decision(rateLimits).isAllowed else {
+            return false
+        }
+        pendingRollovers -= 1
+        return true
     }
 }
 
@@ -185,4 +219,3 @@ struct UsageResetEvent: Codable, Identifiable {
         self.detectedAt = detectedAt
     }
 }
-

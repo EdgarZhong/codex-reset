@@ -42,10 +42,10 @@ final class AppModel: ObservableObject {
     /// 当前连接的 Tier 2 客户端（bundled app-server，manager 独占持有，退出时统一回收）
     private var client: AppServerClient?
     private var timer: Timer?
-    /// 记录上一次是否处于「已到上限」状态，用于恢复检测
-    private var wasLimited = false
     /// 上次等待恢复确认的原因（避免每 30s 重复刷日志）
     private var lastRecoveryWaitReason: String?
+    /// primary 5h resetsAt baseline 与待处理 rollover trigger
+    private var resetTrigger = PrimaryWindowResetTracker()
 
     init(codexHome: String = AppModel.defaultCodexHome()) {
         self.codexHome = codexHome
@@ -233,24 +233,22 @@ final class AppModel: ObservableObject {
     private func applyRateLimits(_ rl: AccountRateLimits) {
         rateLimits = rl
         lastError = nil
-        checkRecovery(rl)
         trackWindowReset(rl)
+        checkRecovery(rl)
     }
 
     // MARK: - 用量历史（5h 窗口时间线）
 
-    /// 上次观测到的 primary 窗口重置时间（Unix 秒）
-    private var lastResetsAt: Int?
-
-    /// 检测 5 小时窗口重置：resetsAt 变化即记录一个新窗口点
+    /// 检测 primary 5 小时窗口重置：首次观测建立 baseline，之后变化记录 pending trigger
     private func trackWindowReset(_ rl: AccountRateLimits) {
         guard let primary = rl.rateLimits.primary, let resetsAt = primary.resetsAt else { return }
-        guard lastResetsAt != resetsAt else { return }
+        let observation = resetTrigger.observe(resetsAt: resetsAt)
+        guard observation != .unchanged else { return }
         // 窗口起点 = 下次重置时间 - 窗口时长（优先用服务端给出的 windowDurationMins，缺失才回退 300 分钟）
         let windowMins = primary.windowDurationMins ?? 300
         let windowStart = resetsAt - windowMins * 60
         appendResetEvent(windowStart: windowStart, nextResetAt: resetsAt, usedPercent: Double(primary.usedPercent))
-        lastResetsAt = resetsAt
+        if observation == .rollover { lastRecoveryWaitReason = nil }
     }
 
     /// 追加一个窗口点并持久化（保留最近 200 条）
@@ -308,37 +306,24 @@ final class AppModel: ObservableObject {
         return result
     }
 
-    /// 用量恢复检测 + 自动继续。
-    /// 恢复许可唯一依据是 QuotaRecovery（ordinaryUsageAllowed == true 且无 reached/spendControl 标记）；
-    /// usedPercent / resetsAt 只用于展示，不作为自动发送的许可。
+    /// 仅当有待处理的 primary 5h rollover 且 QuotaRecovery 明确允许时自动继续。
     private func checkRecovery(_ rl: AccountRateLimits) {
-        let primary = rl.rateLimits.primary
-        let isLimited = (rl.rateLimits.rateLimitReachedType != nil &&
-                         rl.rateLimits.rateLimitReachedType != "none") ||
-                        (primary?.usedPercent ?? 0) >= 100
-
-        if wasLimited {
-            let decision = QuotaRecovery.decision(rl)
-            if decision.isAllowed {
-                appendLog("检测到用量恢复！usedPercent=\(primary?.usedPercent ?? -1)%，ordinaryUsageAllowed=true",
-                          "Usage recovered! usedPercent=\(primary?.usedPercent ?? -1)%, ordinaryUsageAllowed=true")
-                notify(title: "Codex 用量已恢复", body: "正在自动继续上次暂停的对话…")
-                lastRecoveryWaitReason = nil
-                wasLimited = false
-                Task { await autoContinueIfNeeded() }
-            } else if isLimited {
-                lastRecoveryWaitReason = nil
-            } else {
-                // 窗口已到期但后端未明确肯定恢复：保持等待，继续轮询，不得据 usedPercent/resetsAt 宣布恢复
-                let reason = decision.reasonText
-                if lastRecoveryWaitReason != reason {
-                    appendLog("用量窗口已到期，但后端未确认恢复（\(reason)），继续轮询…",
-                              "Window expired but recovery not confirmed by backend (\(reason)); keep polling…")
-                    lastRecoveryWaitReason = reason
-                }
+        let decision = QuotaRecovery.decision(rl)
+        if resetTrigger.consumePendingIfAllowed(rl) {
+            appendLog("primary 5 小时窗口已重置，后端确认 ordinary usage 允许，开始自动继续",
+                      "Primary 5-hour window rolled over and backend confirmed ordinary usage; starting auto-continue")
+            notify(title: "Codex 用量窗口已重置", body: "正在自动继续已勾选的对话…")
+            lastRecoveryWaitReason = nil
+            // 当前选择保持勾选；新窗口是一轮新的自动继续周期。
+            Task { await autoContinueIfNeeded() }
+        } else if resetTrigger.pendingRollovers > 0 {
+            // ordinaryUsageAllowed 暂不可用或仍被额度标记阻止时保留 trigger，后续刷新再判。
+            let reason = decision.reasonText
+            if lastRecoveryWaitReason != reason {
+                appendLog("primary 5 小时窗口已重置，但后端尚未确认恢复（\(reason)），继续轮询…",
+                          "Primary 5-hour window rolled over but recovery is not confirmed (\(reason)); keep polling…")
+                lastRecoveryWaitReason = reason
             }
-        } else {
-            wasLimited = isLimited
         }
     }
 
@@ -362,11 +347,23 @@ final class AppModel: ObservableObject {
                       "Recovery not permitted (\(decision.reasonText)); waiting…")
             return
         }
+        // 每个新的 rollover 都是新一轮自动继续，保留勾选但允许已成功的会话再次继续。
+        // 先清除之前窗口的 handled 标记；随后补查出的本轮回执仍会重新标记，避免重复发送。
+        engine.rearmHandledThreads(for: Set(targets.map(\.threadId)))
         // 先补查历史 uncertain 提交；确认结果后才允许新一轮发送
         await engine.resolvePendingReconciliations()
+        let confirmedDuringReconciliation = Set(targets.compactMap { target in
+            engine.alreadyHandled(target.threadId) ? target.threadId : nil
+        })
         for paused in targets {
-            if engine.alreadyHandled(paused.threadId) {
-                appendLog("已处理过「\(paused.title)」，跳过", "Already handled \"\(paused.title)\"; skipping")
+            // 保留旧的跨窗口 handled 跳过实现，后续可作为配置或分支启用；当前先停用。
+            // if engine.alreadyHandled(paused.threadId) {
+            //     appendLog("已处理过「\(paused.title)」，跳过", "Already handled \"\(paused.title)\"; skipping")
+            //     continue
+            // }
+            if confirmedDuringReconciliation.contains(paused.threadId) {
+                appendLog("「\(paused.title)」本轮回执已确认，跳过重复发送",
+                          "Receipt for \"\(paused.title)\" was confirmed this cycle; skipping duplicate send")
                 continue
             }
             if engine.isPendingReconciliation(paused.threadId) {

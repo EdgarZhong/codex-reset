@@ -74,6 +74,12 @@ final class AutoContinueEngine {
         return handledThreads.contains(threadId)
     }
 
+    /// 为一个新的自动继续周期解除这些目标的旧 handled 标记；pending reconciliation 保持不变。
+    func rearmHandledThreads(for threadIds: Set<String>) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        handledThreads.subtract(threadIds)
+    }
+
     func isPendingReconciliation(_ threadId: String) -> Bool {
         stateLock.lock(); defer { stateLock.unlock() }
         return pendingReconciliations[threadId] != nil

@@ -1,10 +1,10 @@
 # CodexReset 控制链路转向（GUI Tier 1 + DB 回执）— 进度同步与 Handoff
 
-> 动态文档，随推进更新。规则与边界见 `AGENTS.md`。最后更新：2026-09-25（日志优化与设置面板收敛已集成验证，待实战）
+> 动态文档，随推进更新。规则与边界见 `AGENTS.md`。最后更新：2026-09-25（5h rollover 自动继续与暂停列表分类调整）
 
 ## 1. 当前目标（唯一核心）
 
-当 Codex 订阅额度恢复时，可靠地向用户勾选的既有 Codex thread 发送当前全局 continuation prompt。**优先进入正在运行的 Codex Desktop（ChatGPT.app）原 thread 并在 GUI 可见地继续**（一个 session 只能被一个内核接管，另起 app-server 用户看不到进展）；GUI 明确未提交时才 fallback 到 bundled app-server。除用户明确提出的日志与设置收敛外，其余产品面不动。
+观察到 primary 5h `resetsAt` rollover 且 `QuotaRecovery.decision()` 明确允许时，向 rollover 当时勾选的既有 Codex thread 发送当前全局 continuation prompt；每个 rollover 至多触发一次，勾选保持不变供下一窗口复用。**优先进入正在运行的 Codex Desktop（ChatGPT.app）原 thread 并在 GUI 可见地继续**（一个 session 只能被一个内核接管，另起 app-server 用户看不到进展）；GUI 明确未提交时才 fallback 到 bundled app-server。除用户明确提出的日志与设置收敛外，其余产品面不动。
 
 ## 2. 本轮口径（2026-09-25 用户最终确认）
 
@@ -103,3 +103,11 @@
 - 截图中的开关实际为「显示全部对话」，并非 Remote Control；Remote Control 设置此前已删除。移除开关后，「全部对话」模块始终可见，原有折叠能力保留。
 - 移除主面板齿轮、独立窗口及 `SettingsPanelView.swift`（旧文件移入 `.archive/`）；本地化不再读取 `UserDefaults.language`，初始化时清理旧语言偏好，旧「显示全部对话」偏好暂不读取。内置默认 continuation prompt 随系统语言，自定义 prompt 不变。
 - 集成验证：`swift build -c release` 通过；日志测试 4/4 通过；代码搜索确认设置窗口、显隐开关与旧语言偏好读取已移除。未安装新 App，未向真实对话发送测试 prompt。
+
+## 9. primary 5h rollover 自动继续与暂停列表分类（2026-09-25）
+
+- `resetsAt` 首次观测仅建立运行期 baseline；后续每次 primary `resetsAt` 变化创建一个 pending rollover。额度判据暂时为 nil/false 时保留 pending，后续刷新确认 `QuotaRecovery.decision()` 允许后消费一次并调用 `autoContinueIfNeeded()`。
+- 新 rollover 开始新的自动继续周期：仍勾选的会话可再次继续；UI 勾选状态不因发送而清除。软件重启会重新建立 baseline，因此当前 5h 窗口内的勾选/取消不会自行触发，等待下一次 rollover。
+- 旧的跨窗口 `alreadyHandled` 跳过代码暂时保留为注释，后续可做配置或分支；当前只跳过本轮 reconciliation 已确认成功的提交，以及仍 pending 的未知提交，避免同一 rollover 重复发送。
+- `usageLimitedThreads()` 先取每个 thread 的最新 turn，再且仅当该 turn 是 `failed` 且 error 包含 `usageLimitExceeded` 时列入暂停列表；只改变 UI 分类，不参与自动继续许可。
+- 新增 `Tests/CodexResetTests/PrimaryWindowResetAndSQLiteReaderTests.swift`，覆盖首次 baseline、未耗尽额度 rollover、额度许可延迟、同一 rollover 一次且下一 rollover 可再次触发、最新成功 turn 隐藏旧限额失败。本次按用户要求未运行测试；不涉及 GUI Tier 1、SQLite submission reconciliation 或 Tier 2。

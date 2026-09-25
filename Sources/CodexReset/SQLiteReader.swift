@@ -47,7 +47,7 @@ final class SQLiteReader {
     private var threadHistoryPath: String { codexHome + "/thread_history_1.sqlite" }
     private var stateDbPath: String { codexHome + "/state_5.sqlite" }
 
-    /// 找出所有因用量上限(usageLimitExceeded)失败暂停的线程（每线程取最新一次失败）。
+    /// 仅当线程最新 turn 本身因用量上限(usageLimitExceeded)失败时，将其列为暂停线程。
     /// thread_turns 中 turn_id 为 ULID，按 turn_id 倒序即按时间倒序。
     func usageLimitedThreads(limit: Int = 20) -> [PausedThread] {
         guard let rows = queryRows(
@@ -58,9 +58,9 @@ final class SQLiteReader {
             JOIN (
                 SELECT thread_id, MAX(turn_id) AS max_turn
                 FROM thread_turns
-                WHERE status = 'failed' AND error_json LIKE '%usageLimitExceeded%'
                 GROUP BY thread_id
             ) m ON t.thread_id = m.thread_id AND t.turn_id = m.max_turn
+            WHERE t.status = 'failed' AND t.error_json LIKE '%usageLimitExceeded%'
             ORDER BY t.turn_id DESC
             LIMIT ?
             """,

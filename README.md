@@ -39,8 +39,10 @@ several agents/projects at once, that's a lot of babysitting.
 
 - **Menu-bar status** — live 5h / 1w usage bars, next-reset countdown, plan
   type and credit balance at a glance.
-- **Auto-resume** — when the 5h window resets, CodexReset automatically sends
-  "继续" to the conversations you've checked. Nothing is pre-selected: tick the
+- **Auto-resume** — after the primary 5h reset is observed and the backend
+  confirms ordinary usage is allowed, CodexReset sends "继续" once to the
+  conversations checked at that window boundary. The checks stay selected for
+  the next window. Nothing is pre-selected: tick the
   paused conversations you care about (or hit "select all"), or add any other
   conversation from the full list.
 - **Browse all conversations** — every project and its conversations are listed
@@ -127,7 +129,14 @@ before a new entry would cross the limit. The panel continues to show the most
 recent 100 entries from the current run. The log directory and files are
 readable only by the current user.
 
-To run the file rotation checks with the Swift command-line tools:
+Run the focused reset and paused-thread checks with the Swift command-line tools:
+
+```bash
+swiftc -parse-as-library Sources/CodexReset/Models.swift Sources/CodexReset/SQLiteReader.swift Tests/CodexResetTests/PrimaryWindowResetAndSQLiteReaderTests.swift -o /tmp/codex-reset-window-tests
+/tmp/codex-reset-window-tests
+```
+
+Run the file rotation checks with the Swift command-line tools:
 
 ```bash
 swiftc -parse-as-library Sources/CodexReset/RotatingFileLogger.swift Tests/CodexResetTests/RotatingFileLoggerTests.swift -o /tmp/codex-reset-logger-tests

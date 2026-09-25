@@ -41,7 +41,7 @@ Tier 2  bundled codex app-server（stdio JSON-RPC，lazy 启动，独占持有�
 - **硬约束**：GUI Tier 1 对某 thread 的尝试在确认完成前，Tier 2 不得对同一 thread 做任何写操作（引擎顺序执行保证）。
 - Tier 2 仅在 GUI 明确未提交（权限缺失、app 无法激活、composer 定位失败、粘贴未生效、提交未发生）时启用。
 - `handledThreads` 只在明确成功或 reconciliation 确认后加入。
-- 额度恢复许可唯一依据：`ordinaryUsageAllowed == true && rateLimitReachedType ∈ {nil,"none"} && spendControlReached != true`；`usedPercent`/`resetsAt` 仅用于 UI。
+- 额度恢复许可唯一依据：`ordinaryUsageAllowed == true && rateLimitReachedType ∈ {nil,"none"} && spendControlReached != true`；`usedPercent` 仅用于 UI，primary `resetsAt` 同时用于识别 5h rollover，但二者都不授予发送许可。
 
 ## 文档分工
 
