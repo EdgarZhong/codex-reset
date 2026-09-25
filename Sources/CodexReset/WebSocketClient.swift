@@ -16,18 +16,28 @@ final class WebSocketClient {
     }
 
     private let transport: Transport
+    private let handshakeTimeout: TimeInterval
     private var fd: Int32 = -1
     private let writeLock = NSLock()
+    private let stateLock = NSLock()
     private var readThread: Thread?
     private var isClosed = false
+    private var closeNotified = false
 
     /// 收到文本消息回调
     var onText: ((String) -> Void)?
-    /// 连接关闭回调
+    /// 连接关闭回调（只会回调一次）
     var onClose: ((Error?) -> Void)?
 
-    init(transport: Transport) {
+    /// 连接是否仍然有效
+    var isOpen: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return !isClosed && fd >= 0
+    }
+
+    init(transport: Transport, handshakeTimeout: TimeInterval = 8) {
         self.transport = transport
+        self.handshakeTimeout = handshakeTimeout
     }
 
     /// 建立底层连接并完成 WebSocket 握手
@@ -40,9 +50,13 @@ final class WebSocketClient {
             newFd = try Self.openUnix(path: path)
         }
         fd = newFd
-        try performHandshake()
+        // 握手必须有超时：坏掉的 socket 可能连上但永不返回 Upgrade 响应
+        try withSocketTimeout(handshakeTimeout) {
+            try performHandshake()
+        }
         let thread = Thread { [weak self] in self?.readLoop() }
         thread.name = "ws-read"
+        thread.stackSize = 512 * 1024
         thread.start()
         readThread = thread
     }
@@ -59,9 +73,14 @@ final class WebSocketClient {
     }
 
     func close() {
-        guard !isClosed else { return }
+        stateLock.lock()
+        let alreadyNotified = closeNotified
+        closeNotified = true
+        let wasClosed = isClosed
         isClosed = true
-        if fd >= 0 {
+        stateLock.unlock()
+        guard !alreadyNotified else { return }
+        if !wasClosed, fd >= 0 {
             if let frame = try? Self.makeMaskedFrame(payload: [], opcode: 0x8) {
                 writeLock.lock()
                 _ = frame.withUnsafeBytes { buf in
@@ -73,6 +92,38 @@ final class WebSocketClient {
             fd = -1
         }
         onClose?(nil)
+    }
+
+    // MARK: - 超时
+
+    /// 在指定超时内执行一段会阻塞读取的操作；超时通过在读取线程关闭 fd 打断阻塞读
+    private func withSocketTimeout<T>(_ timeout: TimeInterval, _ body: () throws -> T) throws -> T {
+        var finished = false
+        let watchdog = Thread { [weak self] in
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if finished { return }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            guard !finished, let self else { return }
+            self.stateLock.lock()
+            let target = self.fd
+            self.fd = -1
+            self.isClosed = true
+            self.stateLock.unlock()
+            if target >= 0 { Darwin.close(target) }
+        }
+        watchdog.name = "ws-timeout"
+        watchdog.stackSize = 128 * 1024
+        watchdog.start()
+        do {
+            let result = try body()
+            finished = true
+            return result
+        } catch {
+            finished = true
+            throw error
+        }
     }
 
     // MARK: - 握手
@@ -118,10 +169,9 @@ final class WebSocketClient {
                     return
                 case 0x9: // ping -> pong
                     writeLock.lock()
-                    if let pong = try? Self.makeMaskedFrame(payload: payload, opcode: 0xA) {
-                        _ = pong.withUnsafeBytes { buf in
-                            try? Self.writeAll(fd, buf.bindMemory(to: UInt8.self).baseAddress!, buf.count)
-                        }
+                    let pong = Self.makeMaskedFrame(payload: payload, opcode: 0xA)
+                    _ = pong.withUnsafeBytes { buf in
+                        try? Self.writeAll(fd, buf.bindMemory(to: UInt8.self).baseAddress!, buf.count)
                     }
                     writeLock.unlock()
                 default:
