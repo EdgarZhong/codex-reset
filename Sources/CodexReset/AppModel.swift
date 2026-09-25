@@ -88,7 +88,7 @@ final class AppModel: ObservableObject {
         // 暂停对话列表来自本地 sqlite，不依赖 app-server，立即加载
         refreshPausedThreads()
         refreshAllThreads()
-        startAccessibilityPolling()
+        startAccessibilityCheck()
         Task { await connectAndBegin() }
     }
 
@@ -424,20 +424,22 @@ final class AppModel: ObservableObject {
 
     private var accessibilityPollTimer: Timer?
 
-    /// 每 2s 实时同步授权状态：面板永不过期，杜绝「已授权却显示未授权」的误报
-    private func startAccessibilityPolling() {
+    /// 启动时检查一次辅助功能授权；未授权才每 2s 轮询，已授权立即停止。
+    /// 权限每次调用实时判定；运行中失效时发送流程会即时发现并经 onNeedAccessibility 回调刷新状态。
+    private func startAccessibilityCheck() {
         accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = nil
+        let trusted = AppleScriptAutomation.hasAccessibilityPermission()
+        accessibilityAuthorized = trusted
+        guard !trusted else { return }
         accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                let trusted = AppleScriptAutomation.hasAccessibilityPermission()
-                if trusted != self.accessibilityAuthorized {
-                    self.accessibilityAuthorized = trusted
-                    self.appendLog(trusted ? "辅助功能已授权，GUI Tier 1 可用"
-                                           : "辅助功能授权已失效（App 可能被重新签名），请在系统设置重新勾选",
-                                   trusted ? "Accessibility granted; GUI Tier 1 available"
-                                           : "Accessibility grant lost (the app may have been re-signed); re-check it in System Settings")
-                }
+                guard AppleScriptAutomation.hasAccessibilityPermission() else { return }
+                self.accessibilityPollTimer?.invalidate()
+                self.accessibilityPollTimer = nil
+                self.accessibilityAuthorized = true
+                self.appendLog("辅助功能已授权，GUI Tier 1 可用", "Accessibility granted; GUI Tier 1 available")
             }
         }
     }
