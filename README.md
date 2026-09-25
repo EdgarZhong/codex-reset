@@ -45,7 +45,8 @@ several agents/projects at once, that's a lot of babysitting.
   conversation from the full list.
 - **Browse all conversations** — every project and its conversations are listed
   (grouped by project, archived and sub-agent threads filtered out). Check any
-  conversation, even one that isn't paused yet, to have it resumed too.
+  conversation, even one that isn't paused yet, to have it resumed too. The
+  section can be collapsed in the main panel.
 - **Double-click to jump** — opens the conversation in Codex via its deep link.
 - **Usage history timeline** — each 5h window reset is recorded automatically,
   so you can see the exact time usage recovers every day.
@@ -56,14 +57,15 @@ several agents/projects at once, that's a lot of babysitting.
 
 ### How auto-resume works
 
-Two channels, most reliable first:
+Two channels, in order:
 
-1. **Local app-server (preferred)** — talks to Codex's bundled local
-   app-server (`remote_control` or a spawned private instance) and starts a new
-   turn with your command. No accessibility permissions needed.
-2. **GUI fallback** — if the desktop app holds the current conversation, it
-   deep-links into Codex, focuses the input box, pastes your command and sends
-   it with **⌘Enter** (requires **Accessibility** permission).
+1. **Codex Desktop GUI** — deep-links into the selected conversation, focuses
+   the input box, pastes your command and sends it with **⌘Enter** (requires
+   **Accessibility** permission). Success is confirmed from the local thread
+   history database before the conversation is marked handled.
+2. **Bundled app-server fallback** — starts a private stdio app-server only when
+   the GUI path clearly did not submit the command. An uncertain GUI result is
+   checked again before any further send.
 
 ## Requirements
 
@@ -77,7 +79,7 @@ Two channels, most reliable first:
 ### Build
 
 ```bash
-git clone https://github.com/boyso/codex-reset.git
+git clone https://github.com/EdgarZhong/codex-reset.git
 cd codex-reset
 swift build -c release
 ```
@@ -89,15 +91,12 @@ swift build -c release
 ./install_launchagent.sh   # (optional) auto-start at login via LaunchAgent
 ```
 
-Then click the menu-bar icon to open the panel. Optionally:
+Then click the menu-bar icon to open the panel. For GUI continuation:
 
 - Give **CodexReset** Accessibility permission (System Settings →
-  Privacy & Security → Accessibility) so the GUI fallback channel can type into
+  Privacy & Security → Accessibility) so the GUI channel can type into
   Codex. The panel shows a live "Accessibility" status so you know when it's
   granted.
-- Enable **remote_control** (toggle in the panel, then restart the Codex app)
-  to use the official local protocol channel — no accessibility permission
-  needed, and it survives re-signing.
 
 ### CLI only
 
@@ -113,15 +112,43 @@ Then click the menu-bar icon to open the panel. Optionally:
 | Auto-resume on/off | panel toggle `用量恢复后自动继续` |
 | Command sent | panel `指令` field (default `继续`) |
 | Which conversations | checkbox list in the panel |
-| `remote_control` | panel toggle (writes `config.toml`) |
 | `CODEX_HOME` | env var overrides `~/.codex` (advanced) |
+
+The interface and its built-in default continuation command follow the macOS
+preferred language (Chinese or English). Custom commands are preserved. There
+is currently no separate settings window.
+
+## Logs
+
+Activity logs are written to `~/Library/Logs/CodexReset/codex-reset.log`. The
+app keeps the current file and four numbered archives (`.1` through `.4`),
+each limited to 1 MiB, for a maximum of 5 MiB of log content. Rotation happens
+before a new entry would cross the limit. The panel continues to show the most
+recent 100 entries from the current run. The log directory and files are
+readable only by the current user.
+
+To run the file rotation checks with the Swift command-line tools:
+
+```bash
+swiftc -parse-as-library Sources/CodexReset/RotatingFileLogger.swift Tests/CodexResetTests/RotatingFileLoggerTests.swift -o /tmp/codex-reset-logger-tests
+/tmp/codex-reset-logger-tests
+```
 
 ## Privacy
 
-- CodexReset reads only **local** files (`~/.codex` state and history
-  databases, read-only) and talks to Codex's local app-server over a local
-  socket.
+- CodexReset reads **local** Codex files and talks to its own bundled
+  app-server over stdio when the GUI cannot submit a command.
+- Activity logs stay in `~/Library/Logs/CodexReset/` and may contain local
+  conversation titles and paths.
 - No data leaves your machine. No account, no telemetry.
+
+## Project documents
+
+| Content | Path |
+|---|---|
+| Collaboration rules and safety boundaries | [`AGENTS.md`](AGENTS.md) |
+| Current progress and handoff | [`CLAUDE.md`](CLAUDE.md) |
+| First implementation round | [`docs/autonomous-runs/20260925-gui-tier1.md`](docs/autonomous-runs/20260925-gui-tier1.md) |
 
 ## Building the .app icon
 

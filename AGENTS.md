@@ -24,7 +24,7 @@ swift build -c release          # 编译
 1. **禁止 broad 进程清理**：不得 `pkill -f` / 扫描杀死任何 Codex/app-server 进程；只能终止本 App 自己 `Process` 持有的子进程。
 2. **禁止修改 Codex 侧状态**：不改 `~/.codex/config.toml` / `~/.codex/auth*` / Codex Desktop App；不安装 standalone CLI；不重启/不 kill Codex Desktop；不 bootstrap 任何 daemon（旧 Remote Control 路线已整体废弃删除）。
 3. **发送限制**：禁止向重要生产 thread 发送测试 prompt。真实端到端发送只允许用一次性临时测试 thread，且须先获用户明确授权。
-4. **不扩大产品面**：不改 ContentView/SettingsPanelView 布局、对话列表、双击打开会话、全局 prompt 控件、用量监控 UI；不做 Goal、per-thread prompt、selectedThreadIds 持久化、SQLite schema 变更。
+4. **不扩大产品面**：未经用户明确要求，不改主面板布局、对话列表、双击打开会话、全局 prompt 控件、用量监控 UI；不做 Goal、per-thread prompt、selectedThreadIds 持久化、SQLite schema 变更。
 5. 文件删除遵循用户全局规则（仓库内移到 `.archive/`，已 gitignore）。
 6. 未收到明确要求前不 git commit / push（2026-09-25 用户已授权本轮起自主提交）。
 
@@ -45,6 +45,6 @@ Tier 2  bundled codex app-server（stdio JSON-RPC，lazy 启动，独占持有�
 
 ## 文档分工
 
-- `README.md`：上游稳定事实与入口（暂保持上游原文，交付后再评估是否补充 fork 说明）
+- `README.md`：fork 的稳定项目事实、运行与测试入口、重要文档索引
 - `AGENTS.md`：本文件，规则与边界
 - `CLAUDE.md`：当前改造进度、已验证协议事实、handoff（**每次会话结束/中断前必须更新**）

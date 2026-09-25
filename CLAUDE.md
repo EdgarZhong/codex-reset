@@ -1,10 +1,10 @@
 # CodexReset 控制链路转向（GUI Tier 1 + DB 回执）— 进度同步与 Handoff
 
-> 动态文档，随推进更新。规则与边界见 `AGENTS.md`。最后更新：2026-09-25（首轮改动完成，待实战验证和后续优化）
+> 动态文档，随推进更新。规则与边界见 `AGENTS.md`。最后更新：2026-09-25（日志优化与设置面板收敛已集成验证，待实战）
 
 ## 1. 当前目标（唯一核心）
 
-当 Codex 订阅额度恢复时，可靠地向用户勾选的既有 Codex thread 发送当前全局 continuation prompt。**优先进入正在运行的 Codex Desktop（ChatGPT.app）原 thread 并在 GUI 可见地继续**（一个 session 只能被一个内核接管，另起 app-server 用户看不到进展）；GUI 明确未提交时才 fallback 到 bundled app-server。其余产品面一律不动。
+当 Codex 订阅额度恢复时，可靠地向用户勾选的既有 Codex thread 发送当前全局 continuation prompt。**优先进入正在运行的 Codex Desktop（ChatGPT.app）原 thread 并在 GUI 可见地继续**（一个 session 只能被一个内核接管，另起 app-server 用户看不到进展）；GUI 明确未提交时才 fallback 到 bundled app-server。除用户明确提出的日志与设置收敛外，其余产品面不动。
 
 ## 2. 本轮口径（2026-09-25 用户最终确认）
 
@@ -80,7 +80,7 @@
 
 ## 5++. 仓库远端与阶段状态（2026-09-25）
 
-- 用户确认首轮改动及测试已完成，等待实战；后续优化需求待用户提出。
+- 用户确认首轮改动及测试已完成，等待实战；本轮增加日志持久化与轮转。
 - GitHub fork：`EdgarZhong/codex-reset`（公开，父仓库 `boyso/codex-reset`）。本地 `origin` 指向 fork，`upstream` 指向原作者仓库；`main` 跟踪 `origin/main`。
 - 首轮本地提交尚未推送到 fork；本阶段只完成远端关联。
 
@@ -90,3 +90,16 @@
 2. 自测套件：`/tmp/codex-reset-selftest/`（易失；main.swift 支持 `--e2e <threadId> <command>` 真实 GUI 事务模式；fake_codex.py 支持 `turn/start模式,turns/list模式` 两段式 mode）
 3. 临时测试 thread：`01a0d813-2a5f-7573-8518-8a2ba45aa0dd`（title「E2E自测对话：请只回复 ok」，用完可删）
 4. 若协议/行为与本文件第 3 节冲突：停下报告，不自行扩大改造
+
+## 7. 日志优化（2026-09-25）
+
+- 运行日志由 `AppModel.appendLog` 同步写入 `~/Library/Logs/CodexReset/codex-reset.log`；面板仍只保留当次运行最近 100 条双语记录。
+- `RotatingFileLogger` 使用进程内锁和跨进程文件锁；单文件最大 1 MiB，当前文件加 4 个归档文件，总日志内容最大 5 MiB。超长单条按 UTF-8 边界截断；目录权限 700、文件权限 600。写盘失败仅报告到 stderr，不阻断业务。
+- 验证：`swift build -c release` 通过；独立日志测试 4/4 通过（容量/轮转/Unicode/并发/权限）；`--query` 无头运行确认实际落盘并核对权限。未执行真实继续发送。
+
+## 8. 设置面板收敛（2026-09-25）
+
+- 用户根据现有设置窗口截图决定暂时移除设置面板，语言直接跟随系统。
+- 截图中的开关实际为「显示全部对话」，并非 Remote Control；Remote Control 设置此前已删除。移除开关后，「全部对话」模块始终可见，原有折叠能力保留。
+- 移除主面板齿轮、独立窗口及 `SettingsPanelView.swift`（旧文件移入 `.archive/`）；本地化不再读取 `UserDefaults.language`，初始化时清理旧语言偏好，旧「显示全部对话」偏好暂不读取。内置默认 continuation prompt 随系统语言，自定义 prompt 不变。
+- 集成验证：`swift build -c release` 通过；日志测试 4/4 通过；代码搜索确认设置窗口、显隐开关与旧语言偏好读取已移除。未安装新 App，未向真实对话发送测试 prompt。

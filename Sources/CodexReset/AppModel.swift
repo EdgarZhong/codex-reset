@@ -30,16 +30,6 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(continueCommand, forKey: "continueCommand") }
     }
     @Published var isWorking = false
-    /// 语言设置：system / zh / en（切换后写回 UserDefaults 并通过 objectWillChange 触发界面刷新）
-    @Published var language: String {
-        didSet {
-            UserDefaults.standard.set(language, forKey: "language")
-            // 默认指令跟随语言：仅当指令仍为内置默认值（继续/Continue）时自动同步切换，用户自定义指令不受影响
-            if continueCommand == "继续" || continueCommand == "Continue" {
-                continueCommand = L("继续", "Continue")
-            }
-        }
-    }
     /// 本 App 是否已获得辅助功能授权（GUI Tier 1 通道所需；无参检测不弹窗）
     @Published var accessibilityAuthorized: Bool = false
     /// 5 小时窗口时间线（每次用量重置记录一个点）
@@ -63,8 +53,13 @@ final class AppModel: ObservableObject {
         self.reader = SQLiteReader(codexHome: codexHome)
         self.engine = AutoContinueEngine(codexHome: codexHome, manager: manager)
         self.autoContinue = UserDefaults.standard.object(forKey: "autoContinue") as? Bool ?? true
-        self.continueCommand = UserDefaults.standard.string(forKey: "continueCommand") ?? L("继续", "Continue")
-        self.language = UserDefaults.standard.string(forKey: "language") ?? "system"
+        let savedCommand = UserDefaults.standard.string(forKey: "continueCommand")
+        if let savedCommand, savedCommand != "继续" && savedCommand != "Continue" {
+            self.continueCommand = savedCommand
+        } else {
+            self.continueCommand = L("继续", "Continue")
+        }
+        UserDefaults.standard.removeObject(forKey: "language")
         engine.onLog = { [weak self] zh, en in
             Task { @MainActor in self?.appendLog(zh, en) }
         }
@@ -487,11 +482,18 @@ final class AppModel: ObservableObject {
     // MARK: - 工具
 
     private func appendLog(_ zh: String, _ en: String) {
+        let now = Date()
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
-        let stamp = formatter.string(from: Date())
+        let stamp = formatter.string(from: now)
         logLines.append(LogEntry(time: stamp, zh: zh, en: en))
         if logLines.count > 100 { logLines.removeFirst(logLines.count - 100) }
+        let fileStamp = ISO8601DateFormatter().string(from: now)
+        do {
+            try RotatingFileLogger.shared.append("[\(fileStamp)] \(zh)")
+        } catch {
+            FileHandle.standardError.write(Data("CodexReset log write failed: \(error)\n".utf8))
+        }
     }
 
     private func notify(title: String, body: String) {

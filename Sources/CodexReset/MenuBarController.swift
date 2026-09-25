@@ -8,8 +8,6 @@ final class MenuBarController: NSObject {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let model: AppModel
-    /// 独立设置窗口（右上角齿轮打开）
-    private var settingsWindow: NSWindow?
     private var cancellables: Set<AnyCancellable> = []
     private var titleTimer: Timer?
 
@@ -30,9 +28,7 @@ final class MenuBarController: NSObject {
             button.toolTip = L("Codex 用量监控", "Codex usage monitor")
         }
 
-        let rootView = ContentView(onOpenSettings: { [weak self] in
-            self?.showSettingsWindow()
-        }).environmentObject(model)
+        let rootView = ContentView().environmentObject(model)
         let hosting = NSHostingController(rootView: rootView)
         popover = NSPopover()
         popover.contentSize = NSSize(width: 400, height: 760)
@@ -123,35 +119,6 @@ final class MenuBarController: NSObject {
         backing.unlockFocus()
         backing.size = NSSize(width: 18, height: 18)
         return backing
-    }
-
-    /// 打开独立设置窗口（右上角齿轮）：只创建一次，再次点击时前置
-    private func showSettingsWindow() {
-        if settingsWindow == nil {
-            let hosting = NSHostingController(rootView: SettingsPanelView().environmentObject(model))
-            if #available(macOS 13.0, *) {
-                hosting.sizingOptions = [.preferredContentSize]
-            }
-            let win = NSWindow(contentViewController: hosting)
-            win.title = L("CodexReset 设置", "CodexReset Settings")
-            win.styleMask = [.titled, .closable, .utilityWindow]
-            win.isReleasedWhenClosed = false
-            win.isMovableByWindowBackground = true
-            settingsWindow = win
-        }
-        guard let win = settingsWindow else { return }
-        if !win.isVisible {
-            // 首次打开放到主屏中央
-            if let screen = NSScreen.main {
-                let rect = screen.visibleFrame
-                win.setFrameOrigin(NSPoint(
-                    x: rect.midX - win.frame.width / 2,
-                    y: rect.midY - win.frame.height / 2
-                ))
-            }
-        }
-        win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func togglePopover() {

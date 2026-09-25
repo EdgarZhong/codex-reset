@@ -6,20 +6,12 @@ private let highlightOrange = Color(red: 0.72, green: 0.33, blue: 0.10)
 /// 主面板：单屏展示用量、倒计时、暂停对话与操作（浅色轻拟物主题）
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
-    /// 右上角「设置」回调（由 MenuBarController 注入：打开独立设置窗口）
-    private let onOpenSettings: (() -> Void)?
     /// 全部对话模块展开状态（默认收起）
     @State private var allExpanded = false
     /// 自定义指令输入区展开状态（默认收起）
     @State private var commandExpanded = false
     /// 当前 Tab：0=概览 1=用量历史 2=日志
     @State private var selectedTab = 0
-    /// 是否在概览中显示「全部对话」模块
-    @AppStorage("showAllThreads") private var showAllThreads = true
-
-    init(onOpenSettings: (() -> Void)? = nil) {
-        self.onOpenSettings = onOpenSettings
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -56,14 +48,12 @@ struct ContentView: View {
         }
     }
 
-    /// 概览：暂停对话 + 全部对话（可隐藏）+ 自动继续模块（沉底）
+    /// 概览：暂停对话 + 全部对话（可折叠）+ 自动继续模块（沉底）
     private var overviewTab: some View {
         VStack(alignment: .leading, spacing: 12) {
             pausedSection
             Divider()
-            if showAllThreads {
-                allSection
-            }
+            allSection
             // 自动继续卡片始终置底
             Spacer(minLength: 8)
             controlsSection
@@ -176,16 +166,6 @@ struct ContentView: View {
                 .font(.headline)
                 .lineLimit(1)
             Spacer()
-            // 右上角：设置（打开独立设置窗口）
-            Button {
-                onOpenSettings?()
-            } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help(L("设置", "Settings"))
         }
     }
 
